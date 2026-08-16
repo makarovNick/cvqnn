@@ -1,0 +1,15 @@
+{
+  "phase_best": 88.6,
+  "binary_best": 86.94,
+  "phase_advantage_pp": 1.6599999999999966,
+  "phase_widths": [
+    48,
+    96,
+    192
+  ],
+  "binary_widths": [
+    68,
+    136,
+    272
+  ]
+}

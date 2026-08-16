@@ -124,7 +124,7 @@ class CFG:
     # "quant" / "fp32" - a single arm only.
     # Overridable via the CVQNN_MODE environment variable; on Kaggle env vars
     # cannot be set, so editing this line is the primary way to configure it.
-    mode            = "vs_binary"
+    mode            = "scaling"
 
     # --- output ---
     out_dir         = "./cvqnn_out"

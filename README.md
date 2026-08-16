@@ -37,20 +37,51 @@ end the configuration is genuinely discrete and stable, so the reported
 accuracy belongs to a network that still exists after the last step rather than
 to a momentary state.
 
+### Does phase beat sign? Yes, by 1.66 pp
+
+The control that settles it: a real-valued binary `{+1, −1}` network widened by
+√2 so that both arms occupy the **same number of bits**. A same-width binary
+network would simply have had half the storage, which is not a comparison.
+Artefacts in [`results/phase-vs-binary-40ep/`](results/phase-vs-binary-40ep).
+
+| arm | shape | bits/weight | best val acc |
+|---|---|---|---|
+| phase `{+1,−1,+i,−i}` | (48, 96, 192) | 2 | **88.60%** |
+| binary `{+1,−1}`, widened | (68, 136, 272) | 1 | 86.94% |
+| | | | **phase advantage: +1.66 pp** |
+
+At a fixed memory budget it is better to spend it on a larger codebook per
+weight than on more weights. The binary arm confirmed it was genuinely real:
+0.0% of its weights landed on an imaginary corner.
+
+Two things worth noting beyond the headline. Binary's flip rate collapses to
+~5% after one epoch while phase sits at ~19% and decays slowly — with one
+decision boundary instead of two diagonals, binary weights have far less to
+argue about. And binary ends with a smaller train–val gap (+3.47 pp against
++6.34), i.e. it underfits rather than overfits, so a longer schedule would
+likely favour it somewhat.
+
+**How solid is 1.66 pp?** The phase arm scored 89.15% in the first experiment
+and 88.60% here on an identical configuration and seed — a 0.55 pp spread from
+GPU non-determinism alone (`cudnn.benchmark`, non-deterministic float
+reductions). So the advantage is roughly three times the observed noise, from a
+single seed per arm. Suggestive, and consistent with the flip-rate and corner
+evidence, but two or three seeds would be needed to call it settled.
+
 ### What this does *not* yet show
 
-The comparison above prices quantization against *full precision*. It does not
-show that **phase beats sign** — the control that would settle that is a
-real-valued binary `{+1, −1}` network of matched capacity, which has not been
-run yet.
-
-The 49.4% imaginary share is suggestive but not sufficient on its own: weight
+The 49.4% imaginary share, taken alone, proves less than it appears to. Weight
 initialization draws `w_real` and `w_imag` i.i.d., so by symmetry roughly half
-the weights start on an imaginary corner anyway. The balance proves the phase
-corners were not *abandoned*; it does not prove they were *earned*. The flip
-rate does show heavy reorganisation early on, so the final assignment is not
-merely frozen initialization noise — but the binary baseline is what turns this
-into an answer.
+the weights start on an imaginary corner anyway: a balanced histogram is the
+*default state*, not a finding. It shows the phase corners were not abandoned,
+not that they were earned — which is why the binary control above exists, and
+why the notebook plots initialization against the trained state rather than the
+trained state alone.
+
+Still open: every number here comes from a **single seed per arm**, and both
+experiments share one architecture family, one dataset and one schedule. The
+measured 0.55 pp run-to-run spread bounds how much weight any single gap can
+carry.
 
 ---
 
