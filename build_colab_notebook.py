@@ -780,6 +780,71 @@ print("verdict:", "phase carries class information" if spread > 0.15
 
 # =============================================================================
 md(r"""
+### The same plot, with the confound removed
+
+The picture above is striking — the classes fan out into distinct angular
+sectors. But read carefully, it may be measuring the wrong thing.
+
+For each sample it plots the logit component of that sample's **own** class,
+so class `c` is read through row `c` of the head. Different classes use
+different weight rows, and different rows point in different directions
+anyway. A fan would appear even if the phase carried nothing about the image.
+
+The confound disappears if the component is held **fixed**. Below, every sample
+is read through the *same* row, coloured by its true class. Now any angular
+separation has to come from the input, because the weights are identical for
+every point.
+
+If the clouds still separate by angle, phase genuinely encodes class. If they
+collapse onto one direction and differ only in radius, the fan above was an
+artefact of the head's rows.
+""")
+
+code(r"""
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+FIXED = [0, 3]   # read every sample through these rows
+
+fig = make_subplots(rows=1, cols=len(FIXED),
+                    subplot_titles=[f"all samples read through row {c} "
+                                    f"({CLASSES[c]})" for c in FIXED])
+
+sep = {}
+for k, c in enumerate(FIXED):
+    ang_c = np.arctan2(lo_im[:, c], lo_re[:, c])
+    per_class = [np.median(ang_c[lab == t]) for t in range(10)]
+    sep[c] = np.std(per_class)
+
+    for t in range(10):
+        m = lab == t
+        fig.add_trace(go.Scatter(
+            x=lo_re[m, c], y=lo_im[m, c], mode="markers", name=CLASSES[t],
+            legendgroup=CLASSES[t], showlegend=(k == 0),
+            marker=dict(size=3, opacity=0.5)), row=1, col=k + 1)
+
+fig.update_layout(height=520,
+                  title="Fixed logit component, coloured by true class")
+for k in range(len(FIXED)):
+    fig.update_xaxes(title_text="Re", row=1, col=k + 1)
+    fig.update_yaxes(title_text="Im", scaleanchor=f"x{k+1 if k else ''}",
+                     scaleratio=1, row=1, col=k + 1)
+fig.show()
+
+for c, s in sep.items():
+    print(f"row {c} ({CLASSES[c]}): spread of per-class median phases = {s:.3f} rad")
+
+worst = min(sep.values())
+print()
+print("verdict:", "phase encodes the INPUT class - the fan is real"
+      if worst > 0.15 else
+      "angles collapse at a fixed row: the earlier fan came from the head rows,"
+      " not from the representation")
+""")
+
+# =============================================================================
+md(r"""
 ## 11. Class separation in feature space
 
 The penultimate layer yields one complex vector per image. Concatenating `Re`
