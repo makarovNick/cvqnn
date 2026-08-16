@@ -167,24 +167,28 @@ print("module loaded from:", found[0])
 md(r"""
 ## 3. A trained model
 
-Two options. The default is a short training run right here (about 10 minutes
-on a T4): to look at the structure of the weights that is plenty, full
-convergence is not required.
+The repository ships the checkpoint from the full 40-epoch Kaggle run
+(`results/kaggle-t4-40ep/quant_best.pt`, 89.15% val accuracy), and the cell
+below picks it up automatically. Everything downstream then describes **that**
+network rather than a hastily retrained stand-in — which matters, because the
+whole question here is what a converged quantized network looks like.
 
-To inspect a full run instead, point `CKPT` at the `best.pt` from the Kaggle
-kernel output.
+If the checkpoint is missing — say you uploaded only the module by hand — the
+cell falls back to training for 12 epochs on the spot, about 10 minutes on a
+T4. That is enough for the weight structure to stop being noise, but the
+numbers will not match the recorded run.
 """)
 
 code(r"""
-import torch, torch.nn as nn
+import torch, torch.nn as nn, glob, os
 
-CKPT   = None    # path to best.pt, or None to train here
-EPOCHS = 12      # enough for the weights to stop being noise
+EPOCHS = 12      # only used if no checkpoint is found
 
 class VizCFG(M.CFG):
     epochs      = EPOCHS
     batch_size  = 256
     quantize    = True
+    weight_mode = "phase4"
     num_workers = 2
     log_every   = 0
     out_dir     = "./viz_out"
@@ -192,13 +196,29 @@ class VizCFG(M.CFG):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 VizCFG.device = device
 
+# set this by hand to override the automatic search
+CKPT = None
+if CKPT is None:
+    hits = glob.glob("**/results/**/quant_best.pt", recursive=True)
+    CKPT = hits[0] if hits else None
+
 model = M.CVQResNet(VizCFG).to(device)
 train_loader, test_loader = M.build_loaders(VizCFG)
 
-if CKPT:
-    model.load_state_dict(torch.load(CKPT, map_location=device))
-    print("checkpoint loaded:", CKPT)
-else:
+loaded = False
+if CKPT and os.path.exists(CKPT):
+    try:
+        # strict=True on purpose: a checkpoint whose architecture silently
+        # disagrees with VizCFG would load a half-random network and every
+        # plot below would describe nothing in particular
+        model.load_state_dict(torch.load(CKPT, map_location=device), strict=True)
+        loaded = True
+        print("checkpoint loaded:", CKPT)
+    except Exception as e:
+        print("checkpoint did not fit the current config, training instead:")
+        print("  ", type(e).__name__, str(e)[:160])
+
+if not loaded:
     crit   = nn.CrossEntropyLoss(label_smoothing=VizCFG.label_smoothing)
     opt    = M.build_optimizer(model, VizCFG)
     sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
@@ -215,7 +235,16 @@ else:
               f"val {vl:.3f}/{va:5.2f}%  {dt:.0f}s")
 
 model.eval()
-print("ready")
+
+# sanity check: measure the loaded network rather than trusting the file name
+with torch.no_grad():
+    correct = total = 0
+    for xb, yb in test_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        correct += (model(xb).argmax(1) == yb).sum().item()
+        total += yb.size(0)
+print(f"val accuracy of the model being visualized: {100*correct/total:.2f}%")
+print("source:", "checkpoint" if loaded else f"trained here for {EPOCHS} epochs")
 """)
 
 # =============================================================================

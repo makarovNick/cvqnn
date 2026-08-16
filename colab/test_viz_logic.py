@@ -304,7 +304,37 @@ def t_init_vs_trained():
     return f"total variation distance: {drift*100:.2f}%"
 
 
+# ------------------------------- 3. the shipped checkpoint still fits the code
+def t_shipped_checkpoint():
+    import glob
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hits = glob.glob(os.path.join(root, "results", "**", "quant_best.pt"),
+                     recursive=True)
+    assert hits, "no checkpoint under results/ - the notebook would silently retrain"
+
+    class VizCFG(M.CFG):
+        device = "cpu"
+        quantize = True
+        weight_mode = "phase4"
+
+    m = M.CVQResNet(VizCFG)
+    sd = torch.load(hits[0], map_location="cpu")
+    # strict: the notebook loads it strictly too, and a drifting architecture
+    # would otherwise produce plots of a half-random network
+    m.load_state_dict(sd, strict=True)
+    m.eval()
+    with torch.no_grad():
+        out = m(torch.randn(2, 3, 32, 32))
+    assert torch.isfinite(out).all()
+
+    dist, n = M.phase_histogram(m)
+    imag = dist[2] + dist[3]
+    return (f"{os.path.basename(hits[0])}, {n/1e6:.2f}M weights, "
+            f"imaginary share {imag*100:.1f}%")
+
+
 for nm, fn in [
+    ("shipped checkpoint loads into current model", t_shipped_checkpoint),
     ("latent weights in the phase square (3D)", t_latent_3d),
     ("margin to the decision boundary", t_margin),
     ("corner distribution", t_vertex_dist),
