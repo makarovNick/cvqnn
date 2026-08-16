@@ -91,6 +91,36 @@ class CFG:
     out_dir         = "./cvqnn_out"
 
 
+def check_gpu_compat(cfg=CFG):
+    """
+    Ранняя проверка, что сборка PyTorch содержит ядра под выданную карту.
+
+    Иначе первая же CUDA-операция падает с cudaErrorNoKernelImageForDevice
+    где-то в глубине сети, и по трейсбеку это выглядит как ошибка в нашем коде.
+    Реальный случай: Kaggle выдаёт Tesla P100 (sm_60), а их предустановленный
+    torch собран под sm_70+ — поддержку Pascal из сборок убрали.
+    """
+    if cfg.device != "cuda":
+        return
+    major, minor = torch.cuda.get_device_capability(0)
+    sm = f"sm_{major}{minor}"
+    arch_list = torch.cuda.get_arch_list()
+    name = torch.cuda.get_device_name(0)
+
+    if sm not in arch_list:
+        raise RuntimeError(
+            f"\n{'!' * 70}\n"
+            f"GPU {name} имеет compute capability {sm}, но установленный\n"
+            f"PyTorch {torch.__version__} собран только под: {' '.join(arch_list)}.\n"
+            f"Любая CUDA-операция упадёт с cudaErrorNoKernelImageForDevice.\n\n"
+            f"Что делать: запросить другой ускоритель (на Kaggle — T4 вместо\n"
+            f"P100: machine_shape в kernel-metadata.json), либо поставить сборку\n"
+            f"torch под {sm}, либо считать на CPU (CFG.device = 'cpu').\n"
+            f"{'!' * 70}"
+        )
+    print(f"[gpu] {name} ({sm}) — совместимость с torch {torch.__version__} подтверждена")
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -602,6 +632,10 @@ def main(cfg=CFG):
           f"(stem={cfg.quantize_stem}, head={cfg.quantize_head})")
     print(f"widths / blocks   : {cfg.widths} / {cfg.blocks}")
     print(f"epochs / bs / lr  : {cfg.epochs} / {cfg.batch_size} / {cfg.lr}")
+
+    # до скачивания данных и построения модели: если карта несовместима,
+    # незачем тратить время сессии
+    check_gpu_compat(cfg)
 
     train_loader, test_loader = build_loaders(cfg)
 

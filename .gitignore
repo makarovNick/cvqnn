@@ -17,5 +17,9 @@ cvqnn_out/
 # иначе копия разъедется с оригиналом
 kaggle/cvqnn_cifar10.py
 
+# выгрузки с Kaggle: логи прогонов и скачанные датасеты
+kaggle/out/
+kaggle/pulled*/
+
 # служебное
 .ipynb_checkpoints/

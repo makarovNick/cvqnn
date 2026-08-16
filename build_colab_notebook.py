@@ -1,0 +1,732 @@
+"""
+Генератор Colab-ноутбука с визуализацией обученной CVQNN.
+
+Ноутбук пишется генератором, а не руками: в .ipynb каждая строка кода —
+элемент JSON-массива, и ручное редактирование почти гарантированно ломает файл.
+Правим этот скрипт и перезапускаем.
+
+    python build_colab_notebook.py
+"""
+
+import json
+import os
+
+NB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "colab", "cvqnn_visualization.ipynb")
+
+cells = []
+
+
+def md(text):
+    cells.append({"cell_type": "markdown", "metadata": {},
+                  "source": text.strip("\n").split("\n")})
+
+
+def code(text):
+    cells.append({"cell_type": "code", "metadata": {}, "outputs": [],
+                  "execution_count": None,
+                  "source": text.strip("\n").split("\n")})
+
+
+# =============================================================================
+md(r"""
+# CVQNN — визуализация комплекснозначной сети с весами в {+1, −1, +i, −i}
+
+Каждый вес этой сети зажат в одну из **четырёх точек комплексной плоскости** —
+корней 4-й степени из единицы. Это 2 бита на вес вместо 32.
+
+Ноутбук отвечает на вопросы, которые не видны в кривой accuracy:
+
+1. **Где на самом деле лежат латентные веса** и насколько уверенно они выбрали
+   свою вершину — или балансируют на границе и мигают от шага к шагу.
+2. **Используются ли все четыре вершины**, или сеть выродилась в две (тогда
+   фазовая степень свободы не работает и мы фактически обучили бинарную сеть).
+3. **Как из чисто вещественной картинки рождается фаза** и как она вращается
+   с глубиной.
+4. **Разделяет ли сеть классы фазой или только амплитудой** выходных логитов.
+
+Визуализации интерактивные (plotly), 3D-сцены можно вращать.
+
+> **Требуется GPU**: `Среда выполнения → Сменить среду выполнения → T4 GPU`
+""")
+
+# =============================================================================
+md(r"""
+## 1. Проверка среды
+
+Первым делом убеждаемся, что GPU действительно выдан — Colab молча даёт CPU,
+если GPU-квота исчерпана, и дальше всё просто работает в 30 раз медленнее.
+""")
+
+code(r"""
+!nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+""")
+
+code(r"""
+import torch, sys
+print("python :", sys.version.split()[0])
+print("torch  :", torch.__version__)
+print("CUDA   :", torch.cuda.is_available(),
+      torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
+""")
+
+code(r"""
+# plotly в Colab предустановлен, но версия бывает старой — 3D-сцены
+# и go.Image ведут себя по-разному между мажорными версиями.
+!pip install -q --upgrade plotly
+import plotly
+print("plotly :", plotly.__version__)
+""")
+
+# =============================================================================
+md(r"""
+## 2. Код проекта из GitHub
+
+Репозиторий приватный, поэтому нужен токен. **Не вставляй его в ячейку** —
+Colab сохраняет и код, и вывод ячеек внутрь `.ipynb`, и токен уедет в файл,
+а оттуда легко и в репозиторий.
+
+Правильный способ — **Secrets** Colab (иконка ключа на левой панели):
+
+| Name | Value |
+|---|---|
+| `GH_TOKEN` | твой GitHub PAT |
+
+Затем включи для секрета доступ этому ноутбуку (тумблер *Notebook access*).
+
+Ниже клонирование идёт через `subprocess`, а не через `!git clone`: строка с
+`!` печатается в вывод целиком вместе с подставленным токеном. Сразу после
+клонирования remote переписывается на чистый URL, потому что иначе токен
+осел бы в `.git/config` внутри виртуалки.
+""")
+
+code(r"""
+REPO = "makarovNick/cvqnn"   # <- поправь, если репозиторий назван иначе
+DIR  = "cvqnn"
+
+import os, subprocess, shutil
+from google.colab import userdata
+
+token = userdata.get('GH_TOKEN')
+
+if os.path.isdir(DIR):
+    shutil.rmtree(DIR)
+
+# токен передаётся аргументом процесса и не печатается в вывод ячейки
+subprocess.run(
+    ["git", "clone", "--depth", "1",
+     f"https://x-access-token:{token}@github.com/{REPO}.git", DIR],
+    check=True, capture_output=True)
+
+# убираем токен из конфига клона
+subprocess.run(["git", "-C", DIR, "remote", "set-url", "origin",
+                f"https://github.com/{REPO}.git"], check=True)
+
+print("склонировано:", REPO)
+!ls -la {DIR}
+""")
+
+md(r"""
+Если репозитория ещё нет — просто загрузи `cvqnn_cifar10.py` вручную
+(панель слева → *Файлы* → *Загрузить*) и пропусти ячейку выше.
+Ячейка ниже подхватит файл откуда угодно.
+""")
+
+code(r"""
+import sys, os, glob
+
+# ищем модуль и в клоне, и в корне — чтобы работал любой из двух путей
+found = glob.glob("**/cvqnn_cifar10.py", recursive=True)
+assert found, "cvqnn_cifar10.py не найден: склонируй репозиторий или загрузи файл вручную"
+
+module_dir = os.path.dirname(os.path.abspath(found[0])) or "."
+if module_dir not in sys.path:
+    sys.path.insert(0, module_dir)
+
+import cvqnn_cifar10 as M
+print("модуль загружен из:", found[0])
+""")
+
+# =============================================================================
+md(r"""
+## 3. Обученная модель
+
+Два пути. По умолчанию — быстрое дообучение прямо здесь (на T4 около 10 минут):
+для визуализации структуры весов этого достаточно, полная сходимость не нужна.
+
+Если хочется смотреть на результат полного прогона — подставь чекпоинт
+`best.pt` из выгрузки Kaggle-ядра в переменную `CKPT`.
+""")
+
+code(r"""
+import torch, torch.nn as nn
+
+CKPT   = None    # путь к best.pt, либо None -> обучаем здесь
+EPOCHS = 12      # хватает, чтобы веса перестали быть шумом
+
+class VizCFG(M.CFG):
+    epochs      = EPOCHS
+    batch_size  = 256
+    quantize    = True
+    num_workers = 2
+    log_every   = 0
+    out_dir     = "./viz_out"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+VizCFG.device = device
+
+model = M.CVQResNet(VizCFG).to(device)
+train_loader, test_loader = M.build_loaders(VizCFG)
+
+if CKPT:
+    model.load_state_dict(torch.load(CKPT, map_location=device))
+    print("чекпоинт загружен:", CKPT)
+else:
+    crit   = nn.CrossEntropyLoss(label_smoothing=VizCFG.label_smoothing)
+    opt    = M.build_optimizer(model, VizCFG)
+    sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
+    scaler = M.make_grad_scaler(VizCFG)
+
+    for ep in range(1, EPOCHS + 1):
+        tl, ta, dt = M.run_epoch(model, train_loader, crit, opt, scaler,
+                                 VizCFG, train=True)
+        with torch.no_grad():
+            vl, va, _ = M.run_epoch(model, test_loader, crit, opt, scaler,
+                                    VizCFG, train=False)
+        sched.step()
+        print(f"epoch {ep:2d}/{EPOCHS}  train {tl:.3f}/{ta:5.2f}%  "
+              f"val {vl:.3f}/{va:5.2f}%  {dt:.0f}s")
+
+model.eval()
+print("готово")
+""")
+
+# =============================================================================
+md(r"""
+## 4. Латентные веса в фазовом квадрате
+
+Обучение идёт по вещественным парам `(w_real, w_imag)`, а в forward каждая
+пара схлопывается в ближайшую вершину. Правило простое: **кто больше по
+модулю, тот и выжил**. Значит границы решения — это диагонали `Re = ±Im`.
+
+На 3D-сцене ниже: горизонтальная плоскость — комплексная плоскость латентного
+веса, вертикальная ось — глубина слоя. Цвет — вершина, в которую вес схлопнется.
+
+Смотреть надо на **границы между цветами**: облако точек, размазанное вдоль
+диагонали, означает слой, где веса не определились и продолжают мигать.
+""")
+
+code(r"""
+import numpy as np
+import plotly.graph_objects as go
+
+VERTEX = ["+1", "-1", "+i", "-i"]
+COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
+MAX_PTS_PER_LAYER = 1500     # иначе plotly задохнётся на сотнях тысяч точек
+
+rng = np.random.default_rng(0)
+layers = M.quant_layers(model)
+
+fig = go.Figure()
+for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
+    xs, ys, zs, txt = [], [], [], []
+    for li, layer in enumerate(layers):
+        wr = layer.w_real.detach().flatten().cpu().numpy()
+        wi = layer.w_imag.detach().flatten().cpu().numpy()
+        code_ = M.phase_code(layer.w_real, layer.w_imag).flatten().cpu().numpy()
+
+        # нормируем послойно: у разных слоёв разный масштаб латентных весов,
+        # без этого глубокие слои сожмутся в точку
+        scale = max(np.abs(wr).max(), np.abs(wi).max()) + 1e-9
+        sel = np.where(code_ == vi)[0]
+        if len(sel) > MAX_PTS_PER_LAYER:
+            sel = rng.choice(sel, MAX_PTS_PER_LAYER, replace=False)
+
+        xs.append(wr[sel] / scale)
+        ys.append(wi[sel] / scale)
+        zs.append(np.full(len(sel), li, dtype=float))
+        txt.append(np.full(len(sel), f"слой {li}", dtype=object))
+
+    fig.add_trace(go.Scatter3d(
+        x=np.concatenate(xs), y=np.concatenate(ys), z=np.concatenate(zs),
+        mode="markers", name=vname, text=np.concatenate(txt),
+        marker=dict(size=1.6, color=vcol, opacity=0.55),
+        hovertemplate="Re=%{x:.3f}<br>Im=%{y:.3f}<br>%{text}<extra>" + vname + "</extra>",
+    ))
+
+# границы решения: диагонали Re = ±Im, протянутые по всей глубине
+for sign in (1, -1):
+    fig.add_trace(go.Scatter3d(
+        x=[-1, 1, None] * len(layers),
+        y=[-sign, sign, None] * len(layers),
+        z=sum([[li, li, None] for li in range(len(layers))], []),
+        mode="lines", line=dict(color="rgba(120,120,120,0.35)", width=2),
+        showlegend=(sign == 1), name="граница решения", hoverinfo="skip"))
+
+fig.update_layout(
+    title="Латентные веса и вершина, в которую они схлопываются",
+    scene=dict(xaxis_title="Re(w) / max", yaxis_title="Im(w) / max",
+               zaxis_title="слой", aspectmode="manual",
+               aspectratio=dict(x=1, y=1, z=1.6)),
+    height=720, legend=dict(itemsizing="constant"))
+fig.show()
+""")
+
+# =============================================================================
+md(r"""
+## 5. Насколько уверенно веса выбрали вершину
+
+Картинка выше показывает расположение, но не даёт числа. Введём **запас до
+границы**:
+
+$$\text{margin} = \frac{\bigl|\,|Re| - |Im|\,\bigr|}{|Re| + |Im|}$$
+
+`margin = 0` — вес ровно на диагонали, любой шаг оптимизатора перебросит его
+в соседнюю вершину. `margin = 1` — вес прижат к оси, решение устойчивое.
+
+Это прямая мера того, сошлось ли квантование. Слой с медианой около нуля
+не выучил дискретную конфигурацию — он всё ещё дрожит.
+""")
+
+code(r"""
+import plotly.graph_objects as go
+
+fig = go.Figure()
+medians = []
+for li, layer in enumerate(layers):
+    wr = layer.w_real.detach().flatten().cpu().numpy()
+    wi = layer.w_imag.detach().flatten().cpu().numpy()
+    margin = np.abs(np.abs(wr) - np.abs(wi)) / (np.abs(wr) + np.abs(wi) + 1e-12)
+    medians.append(np.median(margin))
+
+    fig.add_trace(go.Violin(
+        y=margin, name=f"{li}", box_visible=True, meanline_visible=False,
+        points=False, width=0.9, line_color=COLORS[li % 4], opacity=0.7))
+
+fig.update_layout(
+    title="Запас до границы решения по слоям (0 = вес балансирует на грани)",
+    xaxis_title="слой", yaxis_title="margin", height=520, showlegend=False)
+fig.show()
+
+print("медианный margin по слоям:",
+      ", ".join(f"{li}:{m:.2f}" for li, m in enumerate(medians)))
+print(f"\nсредний по сети: {np.mean(medians):.3f}")
+""")
+
+# =============================================================================
+md(r"""
+## 6. Используются ли все четыре вершины
+
+Ключевая проверка гипотезы. Если сеть разложила веса примерно поровну по
+четырём вершинам — фазовая степень свободы работает. Если мнимые вершины
+`+i`/`−i` пустуют, значит сеть свелась к обычной бинарной `{+1, −1}`,
+и вся комплексная машинерия не даёт ничего.
+
+Пунктир на 25% — равномерное распределение.
+""")
+
+code(r"""
+import plotly.graph_objects as go
+
+per_layer = np.zeros((len(layers), 4))
+for li, layer in enumerate(layers):
+    c = M.phase_code(layer.w_real, layer.w_imag).flatten().cpu().numpy()
+    per_layer[li] = np.bincount(c, minlength=4) / c.size
+
+fig = go.Figure()
+for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
+    fig.add_trace(go.Bar(x=[f"слой {i}" for i in range(len(layers))],
+                         y=per_layer[:, vi] * 100,
+                         name=vname, marker_color=vcol))
+fig.add_hline(y=25, line_dash="dash", line_color="gray",
+              annotation_text="равномерно (25%)")
+fig.update_layout(barmode="group", height=480,
+                  title="Распределение весов по вершинам, %",
+                  yaxis_title="доля весов, %")
+fig.show()
+
+total = per_layer.mean(axis=0)
+print("по сети в целом:",
+      ", ".join(f"{v}={p*100:.1f}%" for v, p in zip(VERTEX, total)))
+imag_share = total[2] + total[3]
+print(f"\nдоля мнимых вершин: {imag_share*100:.1f}%")
+print("вывод:", "фазовая степень свободы используется"
+      if imag_share > 0.35 else "СЕТЬ ВЫРОЖДАЕТСЯ В БИНАРНУЮ — мнимые вершины почти пусты")
+""")
+
+# =============================================================================
+md(r"""
+## 7. Как рождается фаза
+
+На вход подаётся **чисто вещественная** картинка: `Im = 0`. Вся фаза, которая
+появляется дальше, создана исключительно умножениями на `±i` внутри сети.
+
+Снимаем активации хуками с нормализационных слоёв — именно оттуда, а **не**
+после `ComplexSplitReLU`. Причина: split-ReLU обнуляет отрицательные части
+и загоняет сигнал в первый квадрант, где фаза зажата в `[0, π/2]`. До
+активации виден полный диапазон.
+
+**Важная оговорка о том, что здесь честно измеряется.** Ширина сети меняется
+между стадиями, поэтому «канал №5» в первом слое и «канал №5» в четвёртом —
+это разные признаки, и ломаная через всю глубину не значила бы ничего.
+Поэтому траектории строятся **только внутри стадии**, где число каналов
+постоянно и индекс канала действительно обозначает один и тот же признак.
+Стадии разведены цветом.
+""")
+
+code(r"""
+import torch
+
+acts = []
+hooks = []
+
+def _hook(name):
+    def fn(mod, inp, out):
+        acts.append((name, out[0].detach().float().cpu(), out[1].detach().float().cpu()))
+    return fn
+
+for name, mod in model.named_modules():
+    if isinstance(mod, M.ComplexAmpNorm):
+        hooks.append(mod.register_forward_hook(_hook(name)))
+
+# один тестовый снимок
+x_batch, y_batch = next(iter(test_loader))
+x_one = x_batch[:1].to(device)
+
+acts.clear()
+with torch.no_grad():
+    _ = model(x_one)
+for h in hooks:
+    h.remove()
+
+print(f"снято активаций: {len(acts)} слоёв")
+print(f"вход: Im == 0 ровно? {bool((torch.zeros_like(x_one) == 0).all())}")
+""")
+
+code(r"""
+import numpy as np
+import plotly.graph_objects as go
+
+N_CHANNELS = 16     # самые «громкие» каналы, иначе каша
+
+# усредняем по пространству: интересует комплексное значение канала, не текстура
+traj_re, traj_im = [], []
+for nm, re_, im_ in acts:
+    r = re_[0].mean(dim=(1, 2)).numpy() if re_.dim() == 4 else re_[0].numpy()
+    i = im_[0].mean(dim=(1, 2)).numpy() if im_.dim() == 4 else im_[0].numpy()
+    traj_re.append(r)
+    traj_im.append(i)
+
+# группируем подряд идущие слои с одинаковым числом каналов = одна стадия.
+# Только внутри такой группы индекс канала обозначает один и тот же признак.
+groups, cur = [], [0]
+for li in range(1, len(traj_re)):
+    if len(traj_re[li]) == len(traj_re[li - 1]):
+        cur.append(li)
+    else:
+        groups.append(cur)
+        cur = [li]
+groups.append(cur)
+groups = [g for g in groups if len(g) > 1]
+
+print("стадии (слои с постоянной шириной):",
+      [(g[0], g[-1], len(traj_re[g[0]])) for g in groups])
+
+PALETTE = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"]
+
+fig = go.Figure()
+for gi, g in enumerate(groups):
+    n_ch = len(traj_re[g[0]])
+    amp = np.sqrt(traj_re[g[-1]] ** 2 + traj_im[g[-1]] ** 2)
+    chans = np.argsort(-amp)[:min(N_CHANNELS, n_ch)]
+    col = PALETTE[gi % len(PALETTE)]
+
+    for k, ci in enumerate(chans):
+        fig.add_trace(go.Scatter3d(
+            x=[traj_re[l][ci] for l in g],
+            y=[traj_im[l][ci] for l in g],
+            z=[float(l) for l in g],
+            mode="lines+markers",
+            line=dict(width=3, color=col), marker=dict(size=3, color=col),
+            name=f"стадия {gi} ({n_ch} каналов)",
+            legendgroup=f"g{gi}", showlegend=(k == 0),
+            hovertemplate=("Re=%{x:.2f}<br>Im=%{y:.2f}<br>слой %{z}"
+                           f"<extra>стадия {gi}, канал {ci}</extra>")))
+
+fig.update_layout(
+    title="Траектории каналов в комплексной плоскости (внутри стадий)",
+    scene=dict(xaxis_title="Re", yaxis_title="Im", zaxis_title="слой",
+               aspectratio=dict(x=1, y=1, z=1.8)),
+    height=720)
+fig.show()
+
+# разброс фазы по глубине — это уже корректно считать по всем слоям,
+# потому что здесь речь о распределении, а не о конкретном канале
+print("\nразброс фазы по слоям (станд. отклонение arg(z), рад):")
+for li, (r, i) in enumerate(zip(traj_re, traj_im)):
+    ph = np.arctan2(i, r)
+    print(f"  слой {li:2d} ({len(r):3d} каналов): {ph.std():.3f}")
+""")
+
+# =============================================================================
+md(r"""
+## 8. Карты признаков: амплитуда и фаза одновременно
+
+Комплексную карту признаков нельзя честно показать одной серой картинкой —
+в каждой точке два числа. Используем **доменную раскраску**, стандартный приём
+для комплексных функций:
+
+* **оттенок** = фаза `arg(z)`,
+* **яркость** = амплитуда `|z|`.
+
+Одинаковый цвет означает одинаковую фазу. Так сразу видно, формирует ли сеть
+пространственно связные фазовые структуры или фаза шумит от пикселя к пикселю.
+""")
+
+code(r"""
+import numpy as np
+import matplotlib.colors as mcolors
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+LAYER_IDX  = min(3, len(acts) - 1)   # неглубокий слой: там ещё видна структура
+N_SHOW     = 8
+
+name, re_t, im_t = acts[LAYER_IDX]
+re_np, im_np = re_t[0].numpy(), im_t[0].numpy()
+
+def domain_rgb(re, im):
+    # фаза -> оттенок, амплитуда -> яркость
+    amp = np.sqrt(re ** 2 + im ** 2)
+    ang = np.arctan2(im, re)
+    h = (ang % (2 * np.pi)) / (2 * np.pi)
+    v = amp / (amp.max() + 1e-9)
+    hsv = np.stack([h, np.ones_like(h), v], axis=-1)
+    return (mcolors.hsv_to_rgb(hsv) * 255).astype(np.uint8)
+
+energy = (re_np ** 2 + im_np ** 2).sum(axis=(1, 2))
+top = np.argsort(-energy)[:N_SHOW]
+
+fig = make_subplots(rows=2, cols=4,
+                    subplot_titles=[f"канал {c}" for c in top],
+                    horizontal_spacing=0.02, vertical_spacing=0.08)
+for k, c in enumerate(top):
+    fig.add_trace(go.Image(z=domain_rgb(re_np[c], im_np[c])),
+                  row=k // 4 + 1, col=k % 4 + 1)
+
+fig.update_xaxes(visible=False)
+fig.update_yaxes(visible=False)
+fig.update_layout(height=560,
+                  title=f"Доменная раскраска карт признаков — {name} "
+                        f"(оттенок = фаза, яркость = амплитуда)")
+fig.show()
+
+print("исходное изображение, класс:", int(y_batch[0]))
+""")
+
+# =============================================================================
+md(r"""
+## 9. Фаза или амплитуда: чем сеть разделяет классы
+
+Финальные логиты — это **модуль** комплексного вектора: вся фазовая информация
+на последнем шаге выбрасывается. Возникает законный вопрос: а использовалась
+ли она вообще, или сеть могла бы обойтись вещественными весами?
+
+Ниже — комплексные выходы головы **до** взятия модуля, по одному набору точек
+на класс. Если облака классов различаются только расстоянием от начала
+координат — работает лишь амплитуда. Если они разошлись **по углу** — фаза
+несёт информацию о классе.
+""")
+
+code(r"""
+import torch, numpy as np
+import plotly.graph_objects as go
+
+N_BATCH = 8
+
+feats_re, feats_im, labels = [], [], []
+with torch.no_grad():
+    for bi, (xb, yb) in enumerate(test_loader):
+        if bi >= N_BATCH:
+            break
+        xb = xb.to(device)
+        r, i = model.stem(xb, torch.zeros_like(xb))
+        r, i = model.stages(r, i)
+        r, i = r.mean(dim=(2, 3)), i.mean(dim=(2, 3))
+        orr, oii = model.head(r, i)
+        feats_re.append(orr.float().cpu().numpy())
+        feats_im.append(oii.float().cpu().numpy())
+        labels.append(yb.numpy())
+
+lo_re = np.concatenate(feats_re)
+lo_im = np.concatenate(feats_im)
+lab   = np.concatenate(labels)
+
+CLASSES = ["самолёт", "авто", "птица", "кот", "олень",
+           "собака", "лягушка", "лошадь", "корабль", "грузовик"]
+
+fig = go.Figure()
+for c in range(10):
+    m = lab == c
+    # берём компоненту логита, отвечающую своему же классу
+    fig.add_trace(go.Scatter(
+        x=lo_re[m, c], y=lo_im[m, c], mode="markers", name=CLASSES[c],
+        marker=dict(size=4, opacity=0.6)))
+
+fig.update_layout(
+    title="Комплексные логиты до взятия модуля (компонента своего класса)",
+    xaxis_title="Re", yaxis_title="Im", height=640,
+    xaxis=dict(scaleanchor="y", scaleratio=1))
+fig.show()
+
+ang = np.arctan2(lo_im[np.arange(len(lab)), lab], lo_re[np.arange(len(lab)), lab])
+per_class_ang = [np.median(ang[lab == c]) for c in range(10)]
+spread = np.std(per_class_ang)
+print("медианная фаза по классам (рад):",
+      ", ".join(f"{c}:{a:+.2f}" for c, a in enumerate(per_class_ang)))
+print(f"\nразброс медианных фаз между классами: {spread:.3f} рад")
+print("вывод:", "фаза несёт информацию о классе" if spread > 0.15
+      else "классы различаются в основном амплитудой")
+""")
+
+# =============================================================================
+md(r"""
+## 10. Разделение классов в пространстве признаков
+
+Предпоследний слой даёт комплексный вектор на изображение. Склеиваем `Re` и
+`Im` в один вещественный вектор и проецируем в 3D методом главных компонент.
+
+Это привычная проверка «а выучилось ли вообще что-то»: чёткие сгустки по
+классам означают, что сеть построила осмысленное представление, несмотря на
+2 бита на вес.
+""")
+
+code(r"""
+import torch, numpy as np
+from sklearn.decomposition import PCA
+import plotly.graph_objects as go
+
+emb_re, emb_im, emb_lab = [], [], []
+with torch.no_grad():
+    for bi, (xb, yb) in enumerate(test_loader):
+        if bi >= 8:
+            break
+        xb = xb.to(device)
+        r, i = model.stem(xb, torch.zeros_like(xb))
+        r, i = model.stages(r, i)
+        emb_re.append(r.mean(dim=(2, 3)).float().cpu().numpy())
+        emb_im.append(i.mean(dim=(2, 3)).float().cpu().numpy())
+        emb_lab.append(yb.numpy())
+
+X = np.concatenate([np.concatenate(emb_re), np.concatenate(emb_im)], axis=1)
+y = np.concatenate(emb_lab)
+
+p3 = PCA(n_components=3).fit(X)
+Z = p3.transform(X)
+
+fig = go.Figure()
+for c in range(10):
+    m = y == c
+    fig.add_trace(go.Scatter3d(
+        x=Z[m, 0], y=Z[m, 1], z=Z[m, 2], mode="markers",
+        name=CLASSES[c], marker=dict(size=2.5, opacity=0.7)))
+
+fig.update_layout(
+    title=f"PCA признаков предпоследнего слоя "
+          f"(объяснённая дисперсия: {p3.explained_variance_ratio_.sum()*100:.1f}%)",
+    scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3"),
+    height=720)
+fig.show()
+""")
+
+# =============================================================================
+md(r"""
+## 11. Сохранение результатов обратно в GitHub
+
+Ячейка ниже коммитит артефакты в репозиторий. Токен снова берётся из Secrets
+и передаётся через `subprocess`, чтобы не печататься в вывод.
+
+Подпись коммита — `noreply`-почта: история коммитов может стать публичной,
+а переписать её потом уже не выйдет.
+""")
+
+code(r"""
+import os, subprocess, json
+from google.colab import userdata
+
+OUT = f"{DIR}/results/colab"
+os.makedirs(OUT, exist_ok=True)
+
+# сводка прогона в машиночитаемом виде
+summary = {
+    "vertex_distribution": {v: float(p) for v, p in zip(VERTEX, total)},
+    "imag_share": float(imag_share),
+    "median_margin_per_layer": [float(m) for m in medians],
+    "class_phase_spread_rad": float(spread),
+}
+with open(f"{OUT}/summary.json", "w") as f:
+    json.dump(summary, f, indent=2, ensure_ascii=False)
+print(json.dumps(summary, indent=2, ensure_ascii=False))
+""")
+
+code(r"""
+token = userdata.get('GH_TOKEN')
+
+def git(*args):
+    return subprocess.run(["git", "-C", DIR, *args],
+                          check=True, capture_output=True, text=True).stdout
+
+git("config", "user.name", "makarovNick")
+git("config", "user.email", "makarovNick@users.noreply.github.com")
+git("add", "-A")
+
+status = git("status", "--short")
+if not status.strip():
+    print("нечего коммитить")
+else:
+    print(status)
+    git("commit", "-m", "colab: сводка визуализации весов и активаций")
+    subprocess.run(
+        ["git", "-C", DIR, "push",
+         f"https://x-access-token:{token}@github.com/{REPO}.git", "HEAD:main"],
+        check=True, capture_output=True)
+    print("запушено")
+""")
+
+# =============================================================================
+md(r"""
+## Что дальше
+
+Если картинки показали, что **мнимые вершины пустуют** — фазовая гипотеза на
+этой архитектуре не работает, и стоит смотреть в сторону явной фазовой
+регуляризации либо инициализации, разводящей веса по четырём вершинам.
+
+Если **margin у глубоких слоёв около нуля** — квантование не сошлось; лечится
+либо более длинным расписанием, либо затуханием шума STE к концу обучения.
+
+Если **фаза логитов не разделяет классы** — модуль на выходе выбрасывает
+слишком много, и имеет смысл попробовать читать логиты иначе: например, как
+проекцию на обучаемое комплексное направление вместо модуля.
+""")
+
+# =============================================================================
+nb = {
+    "cells": cells,
+    "metadata": {
+        "colab": {"provenance": [], "toc_visible": True},
+        "kernelspec": {"display_name": "Python 3", "name": "python3"},
+        "language_info": {"name": "python"},
+        "accelerator": "GPU",
+    },
+    "nbformat": 4,
+    "nbformat_minor": 0,
+}
+
+os.makedirs(os.path.dirname(NB_PATH), exist_ok=True)
+with open(NB_PATH, "w", encoding="utf-8") as f:
+    json.dump(nb, f, ensure_ascii=False, indent=1)
+
+n_code = sum(1 for c in cells if c["cell_type"] == "code")
+n_md = sum(1 for c in cells if c["cell_type"] == "markdown")
+print(f"записано: {NB_PATH}")
+print(f"ячеек: {n_code} кода + {n_md} markdown")
