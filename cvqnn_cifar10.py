@@ -64,9 +64,25 @@ class CFG:
     num_classes     = 10
 
     # --- QUANTIZATION SWITCH (the main experimental knob) ---
-    # True  -> weights projected onto {+1,-1,+i,-i}: the hypothesis under test
-    # False -> plain complex FP32 network: the control arm of the ablation
+    # True  -> weights are quantized (see weight_mode below)
+    # False -> plain complex FP32 network: the full-precision control arm
     quantize        = True
+
+    # Which quantizer, when quantize is True:
+    #   "phase4" - {+1,-1,+i,-i}, 2 bits/weight: the hypothesis under test
+    #   "binary" - {+1,-1}, 1 bit/weight, purely real: the control that asks
+    #              whether phase beats sign. In this mode the imaginary path is
+    #              switched off entirely (see real_only in ComplexAmpNorm) -
+    #              merely zeroing the imaginary weights is not enough, because
+    #              the learnable beta_im would revive the imaginary channel and
+    #              hand the baseline capacity a binary network must not have.
+    weight_mode     = "phase4"
+
+    # Widths for the binary arm. At 1 bit/weight it needs 2x the weights to
+    # match the 2-bit budget, and parameter count scales with width^2, so the
+    # channels grow by sqrt(2). main() prints the actual bit totals so the
+    # match can be audited rather than taken on trust.
+    binary_widths   = (68, 136, 272)
     quantize_stem   = True            # quantize the first conv (BNN practice: keep it FP)
     quantize_head   = True            # quantize the final linear
     per_channel_scale = True          # scale as a per-output-channel vector (False -> scalar)
@@ -87,7 +103,7 @@ class CFG:
     # "quant" / "fp32" - a single arm only.
     # Overridable via the CVQNN_MODE environment variable; on Kaggle env vars
     # cannot be set, so editing this line is the primary way to configure it.
-    mode            = "both"
+    mode            = "vs_binary"
 
     # --- output ---
     out_dir         = "./cvqnn_out"
@@ -178,6 +194,27 @@ def phase_quantize(w_real, w_imag):
     return PhaseQuantSTE.apply(w_real, w_imag)
 
 
+class BinarySignSTE(torch.autograd.Function):
+    """Binary {+1,-1} quantizer, the control arm against which phase is judged.
+
+    Same straight-through trick, same sign(0) = +1 convention as PhaseQuantSTE,
+    so the only difference between the two arms is the size of the codebook.
+    """
+
+    @staticmethod
+    def forward(ctx, w_real):
+        ones = torch.ones_like(w_real)
+        return torch.where(w_real >= 0, ones, -ones)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g
+
+
+def binary_quantize(w_real):
+    return BinarySignSTE.apply(w_real)
+
+
 @torch.no_grad()
 def phase_code(w_real, w_imag):
     """Integer corner id: 0:+1, 1:-1, 2:+i, 3:-i. Used for diagnostics only."""
@@ -222,9 +259,10 @@ class _ComplexQuantBase(nn.Module):
     """Shared plumbing: latent weights, quantization, learnable scale."""
 
     def __init__(self, weight_shape, out_features, fan_in, quantize=True,
-                 per_channel_scale=True):
+                 per_channel_scale=True, weight_mode="phase4"):
         super().__init__()
         self.quantize = quantize
+        self.weight_mode = weight_mode if quantize else "fp32"
         self.fan_in = fan_in
 
         # Latent FP32 copies, initialised ~ N(0, 1/sqrt(fan_in)). The projection
@@ -232,7 +270,16 @@ class _ComplexQuantBase(nn.Module):
         # sits comfortably inside the [-1, 1] clipping range.
         std = 1.0 / math.sqrt(fan_in)
         self.w_real = nn.Parameter(torch.randn(weight_shape) * std)
-        self.w_imag = nn.Parameter(torch.randn(weight_shape) * std)
+
+        if self.weight_mode == "binary":
+            # No imaginary weights at all in the binary arm - registering them
+            # as a zero buffer rather than a parameter keeps the diagnostics
+            # working (phase_code then reports every weight on a real corner,
+            # which is exactly right) without inflating the parameter count or
+            # creating a tensor that never receives a gradient.
+            self.register_buffer("w_imag", torch.zeros(weight_shape))
+        else:
+            self.w_imag = nn.Parameter(torch.randn(weight_shape) * std)
 
         # Learnable REAL scale: quantized weights have unit modulus, so output
         # variance grows with fan_in. The scale pulls the signal back into a
@@ -241,25 +288,33 @@ class _ComplexQuantBase(nn.Module):
         self.scale = nn.Parameter(torch.full((n_scale,), 1.0 / math.sqrt(fan_in)))
 
     def effective_weights(self):
-        if self.quantize:
-            return phase_quantize(self.w_real, self.w_imag)
-        return self.w_real, self.w_imag
+        if not self.quantize:
+            return self.w_real, self.w_imag
+        if self.weight_mode == "binary":
+            return binary_quantize(self.w_real), self.w_imag  # w_imag is a zero buffer
+        return phase_quantize(self.w_real, self.w_imag)
+
+    def bits_per_weight(self):
+        return {"phase4": 2, "binary": 1}.get(self.weight_mode, 32)
 
     @torch.no_grad()
     def clip_latent_(self, limit):
         if self.quantize and limit is not None:
             self.w_real.clamp_(-limit, limit)
-            self.w_imag.clamp_(-limit, limit)
+            if isinstance(self.w_imag, nn.Parameter):
+                self.w_imag.clamp_(-limit, limit)
 
 
 class ComplexQuantLinear(_ComplexQuantBase):
-    def __init__(self, in_features, out_features, quantize=True, per_channel_scale=True):
+    def __init__(self, in_features, out_features, quantize=True, per_channel_scale=True,
+                 weight_mode="phase4"):
         super().__init__(
             weight_shape=(out_features, in_features),
             out_features=out_features,
             fan_in=in_features,
             quantize=quantize,
             per_channel_scale=per_channel_scale,
+            weight_mode=weight_mode,
         )
 
     def forward(self, x_re, x_im):
@@ -272,13 +327,14 @@ class ComplexQuantLinear(_ComplexQuantBase):
 
 class ComplexQuantConv2d(_ComplexQuantBase):
     def __init__(self, in_ch, out_ch, kernel_size, stride=1, padding=0,
-                 quantize=True, per_channel_scale=True):
+                 quantize=True, per_channel_scale=True, weight_mode="phase4"):
         super().__init__(
             weight_shape=(out_ch, in_ch, kernel_size, kernel_size),
             out_features=out_ch,
             fan_in=in_ch * kernel_size * kernel_size,
             quantize=quantize,
             per_channel_scale=per_channel_scale,
+            weight_mode=weight_mode,
         )
         self.stride = stride
         self.padding = padding
@@ -318,17 +374,25 @@ class ComplexAmpNorm(nn.Module):
     Running statistics are tracked BatchNorm-style so that eval is deterministic.
     """
 
-    def __init__(self, num_features, momentum=0.1, eps=1e-5, affine=True):
+    def __init__(self, num_features, momentum=0.1, eps=1e-5, affine=True,
+                 real_only=False):
         super().__init__()
         self.momentum = momentum
         self.eps = eps
         self.affine = affine
+        # real_only is what makes the binary control genuinely real-valued.
+        # With real weights the imaginary channel would still be non-zero,
+        # because beta_im injects a learnable bias into it - giving the
+        # baseline a second, independent real network for free. Dropping
+        # beta_im keeps Im identically zero from input to logits.
+        self.real_only = real_only
         self.register_buffer("running_amp", torch.ones(num_features))
         if affine:
             # gamma is shared by Re and Im: a phase-preserving rescale
             self.gamma = nn.Parameter(torch.ones(num_features))
             self.beta_re = nn.Parameter(torch.zeros(num_features))
-            self.beta_im = nn.Parameter(torch.zeros(num_features))
+            if not real_only:
+                self.beta_im = nn.Parameter(torch.zeros(num_features))
 
     def forward(self, x_re, x_im):
         dims = [0] + list(range(2, x_re.dim()))          # everything but the channel axis
@@ -350,7 +414,9 @@ class ComplexAmpNorm(nn.Module):
         if self.affine:
             g = self.gamma.view(shape).to(x_re.dtype)
             x_re = x_re * g + self.beta_re.view(shape).to(x_re.dtype)
-            x_im = x_im * g + self.beta_im.view(shape).to(x_im.dtype)
+            x_im = x_im * g
+            if not self.real_only:
+                x_im = x_im + self.beta_im.view(shape).to(x_im.dtype)
         return x_re, x_im
 
 
@@ -366,23 +432,38 @@ class ComplexSequential(nn.Sequential):
 # ==============================================================================
 # 4. MODEL: complex-valued ResNet
 # ==============================================================================
+def is_real_only(cfg):
+    """True when the network must stay purely real: the binary control arm."""
+    return cfg.quantize and getattr(cfg, "weight_mode", "phase4") == "binary"
+
+
+def effective_widths(cfg):
+    """Widths for this arm - the binary control is widened to match bits."""
+    if is_real_only(cfg):
+        return cfg.binary_widths
+    return cfg.widths
+
+
 class ComplexBasicBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1, cfg=CFG):
         super().__init__()
+        wm = getattr(cfg, "weight_mode", "phase4")
+        ro = is_real_only(cfg)
+
         self.conv1 = ComplexQuantConv2d(in_ch, out_ch, 3, stride, 1,
-                                        cfg.quantize, cfg.per_channel_scale)
-        self.norm1 = ComplexAmpNorm(out_ch)
+                                        cfg.quantize, cfg.per_channel_scale, wm)
+        self.norm1 = ComplexAmpNorm(out_ch, real_only=ro)
         self.act = ComplexSplitReLU()
         self.conv2 = ComplexQuantConv2d(out_ch, out_ch, 3, 1, 1,
-                                        cfg.quantize, cfg.per_channel_scale)
-        self.norm2 = ComplexAmpNorm(out_ch)
+                                        cfg.quantize, cfg.per_channel_scale, wm)
+        self.norm2 = ComplexAmpNorm(out_ch, real_only=ro)
 
         self.downsample = None
         if stride != 1 or in_ch != out_ch:
             self.downsample = ComplexSequential(
                 ComplexQuantConv2d(in_ch, out_ch, 1, stride, 0,
-                                   cfg.quantize, cfg.per_channel_scale),
-                ComplexAmpNorm(out_ch),
+                                   cfg.quantize, cfg.per_channel_scale, wm),
+                ComplexAmpNorm(out_ch, real_only=ro),
             )
 
     def forward(self, x_re, x_im):
@@ -402,15 +483,18 @@ class ComplexBasicBlock(nn.Module):
 class CVQResNet(nn.Module):
     def __init__(self, cfg=CFG):
         super().__init__()
-        w = cfg.widths
+        w = effective_widths(cfg)
         b = cfg.blocks
+        wm = getattr(cfg, "weight_mode", "phase4")
+        ro = is_real_only(cfg)
+        self.real_only = ro
 
         # --- Stem ---
         self.stem = ComplexSequential(
             ComplexQuantConv2d(3, w[0], 3, 1, 1,
                                cfg.quantize and cfg.quantize_stem,
-                               cfg.per_channel_scale),
-            ComplexAmpNorm(w[0]),
+                               cfg.per_channel_scale, wm),
+            ComplexAmpNorm(w[0], real_only=ro),
             ComplexSplitReLU(),
         )
 
@@ -427,7 +511,7 @@ class CVQResNet(nn.Module):
         # --- Head ---
         self.head = ComplexQuantLinear(in_ch, cfg.num_classes,
                                        cfg.quantize and cfg.quantize_head,
-                                       cfg.per_channel_scale)
+                                       cfg.per_channel_scale, wm)
         # The magnitude is non-negative with a narrow dynamic range, so a
         # learnable temperature plus a per-class shift give softmax room to work.
         self.logit_scale = nn.Parameter(torch.tensor(4.0))
@@ -650,10 +734,19 @@ def main(cfg=CFG):
 
     model = CVQResNet(cfg).to(cfg.device)
     n_params = sum(p.numel() for p in model.parameters())
-    n_quant = sum(l.w_real.numel() + l.w_imag.numel() for l in quant_layers(model)) // 2
     print(f"total parameters  : {n_params / 1e6:.2f}M")
-    print(f"quantized weights : {n_quant / 1e6:.2f}M "
-          f"(~{n_quant * 2 / 8 / 1e6:.2f} MB packed at 2 bits each)")
+
+    # The bit budget is printed rather than assumed: the whole point of the
+    # binary control is that it costs the SAME number of bits, and a claim
+    # like that should be auditable from the log instead of trusted.
+    qls = quant_layers(model)
+    if qls:
+        n_quant = sum(l.w_real.numel() for l in qls)
+        total_bits = sum(l.w_real.numel() * l.bits_per_weight() for l in qls)
+        print(f"quantized weights : {n_quant / 1e6:.2f}M "
+              f"@ {qls[0].bits_per_weight()} bit ({cfg.weight_mode})")
+        print(f"WEIGHT BIT BUDGET : {total_bits / 1e6:.2f} Mbit "
+              f"(~{total_bits / 8 / 1e6:.2f} MB packed)")
     print("-" * 78)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
@@ -816,17 +909,94 @@ def run_ab(cfg=CFG):
     return hist_q, hist_f
 
 
+# ==============================================================================
+# 10. THE DECISIVE CONTROL: phase (2 bits) vs sign (1 bit) at an equal bit budget
+# ==============================================================================
+def run_phase_vs_binary(cfg=CFG):
+    """
+    Does phase beat sign?
+
+    Comparing a 2-bit complex network against a 1-bit real one of the same
+    width would be a rigged fight - it simply has twice the storage. So the
+    binary arm is widened by sqrt(2) (parameter count grows as width^2), which
+    doubles its weight count and lands both arms on the same number of bits.
+
+    That makes the question the honest one: given a fixed memory budget, is it
+    better to spend it on a larger codebook per weight, or on more weights?
+    """
+    base_out = cfg.out_dir
+
+    class PhaseCFG(cfg):
+        quantize = True
+        weight_mode = "phase4"
+
+    class BinCFG(cfg):
+        quantize = True
+        weight_mode = "binary"
+
+    PhaseCFG.out_dir = os.path.join(base_out, "phase4")
+    BinCFG.out_dir = os.path.join(base_out, "binary")
+
+    print("\n\n" + "#" * 78)
+    print("#  ARM A: PHASE  {+1, -1, +i, -i}  - 2 bits/weight")
+    print("#" * 78)
+    _, hist_p = main(PhaseCFG)
+
+    print("\n\n" + "#" * 78)
+    print(f"#  ARM B: BINARY  {{+1, -1}}  - 1 bit/weight, widened to {cfg.binary_widths}")
+    print("#" * 78)
+    _, hist_b = main(BinCFG)
+
+    best_p = max(hist_p["val_acc"])
+    best_b = max(hist_b["val_acc"])
+
+    print("\n" + "=" * 78)
+    print(" PHASE vs SIGN, equal bit budget")
+    print("=" * 78)
+    print(f"  phase  {cfg.widths}, 2 bit/weight : {best_p:.2f}%")
+    print(f"  binary {cfg.binary_widths}, 1 bit/weight : {best_b:.2f}%")
+    print(f"  PHASE ADVANTAGE : {best_p - best_b:+.2f} pp")
+    print("  (compare the WEIGHT BIT BUDGET lines above: if they differ by more")
+    print("   than a few percent, the arms are not matched and this gap is void)")
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    ep = range(1, len(hist_p["val_acc"]) + 1)
+    ax[0].plot(ep, hist_p["val_acc"], label=f"phase 2-bit ({best_p:.1f}%)")
+    ax[0].plot(ep, hist_b["val_acc"], label=f"binary 1-bit, wider ({best_b:.1f}%)")
+    ax[0].set_title("Val accuracy at an equal bit budget")
+    ax[0].set_xlabel("epoch"); ax[0].legend(); ax[0].grid(alpha=0.3)
+
+    ax[1].plot(ep, [f * 100 for f in hist_p["flip_rate"]], label="phase")
+    ax[1].plot(ep, [f * 100 for f in hist_b["flip_rate"]], label="binary")
+    ax[1].set_title("Weight flip rate, % / epoch")
+    ax[1].set_xlabel("epoch"); ax[1].legend(); ax[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(base_out, "phase_vs_binary.png"), dpi=140)
+    plt.show()
+
+    with open(os.path.join(base_out, "phase_vs_binary.json"), "w") as f:
+        json.dump({"phase_best": best_p, "binary_best": best_b,
+                   "phase_advantage_pp": best_p - best_b,
+                   "phase_widths": list(cfg.widths),
+                   "binary_widths": list(cfg.binary_widths)}, f, indent=2)
+    return hist_p, hist_b
+
+
 if __name__ == "__main__":
     # The mode comes from an environment variable so that this file stays
     # self-contained: a Kaggle script kernel takes exactly one file and no argv.
-    #   quant - quantized network only
-    #   fp32  - FP32 control only
-    #   both  - both runs plus the comparison (default, see CFG.mode)
+    #   quant     - quantized network only
+    #   fp32      - FP32 control only
+    #   both      - quantized + FP32 control and their comparison
+    #   vs_binary - phase vs sign at an equal bit budget (see CFG.mode)
     mode = os.environ.get("CVQNN_MODE", CFG.mode).lower()
     print(f"[mode] CVQNN_MODE={mode}")
 
     if mode == "both":
         run_ab(CFG)
+    elif mode == "vs_binary":
+        run_phase_vs_binary(CFG)
     elif mode == "fp32":
         class _FP(CFG):
             quantize = False

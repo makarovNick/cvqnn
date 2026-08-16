@@ -222,7 +222,95 @@ def test_model():
 
 
 # ==============================================================================
-# 5. MINI-TRAINING (does the loss actually go down?)
+# 5. BINARY CONTROL ARM
+# ==============================================================================
+def test_binary_control():
+    print("\n--- 5. Binary control {+1,-1} ---")
+
+    class PhaseCFG(M.CFG):
+        widths = (16, 32)
+        blocks = (1, 1)
+        quantize = True
+        weight_mode = "phase4"
+
+    class BinCFG(M.CFG):
+        widths = (16, 32)
+        binary_widths = (23, 45)      # ~sqrt(2) wider
+        blocks = (1, 1)
+        quantize = True
+        weight_mode = "binary"
+
+    torch.manual_seed(0)
+    ph = M.CVQResNet(PhaseCFG)
+    torch.manual_seed(0)
+    bn = M.CVQResNet(BinCFG)
+
+    check("binary arm uses the widened channel counts",
+          M.effective_widths(BinCFG) == BinCFG.binary_widths,
+          str(M.effective_widths(BinCFG)))
+
+    # w_imag must not be a trainable parameter in the binary arm, otherwise it
+    # would sit in the optimizer collecting no gradient
+    bl = M.quant_layers(bn)
+    imag_params = [l for l in bl if isinstance(l.w_imag, nn.Parameter)]
+    check("binary arm has no imaginary weight parameters", len(imag_params) == 0,
+          f"{len(imag_params)} of {len(bl)} layers still carry one")
+
+    check("binary weights quantize to 1 bit", bl[0].bits_per_weight() == 1)
+    check("phase weights quantize to 2 bits",
+          M.quant_layers(ph)[0].bits_per_weight() == 2)
+
+    # THE point of the control: the bit budgets must actually match
+    bits_ph = sum(l.w_real.numel() * l.bits_per_weight() for l in M.quant_layers(ph))
+    bits_bn = sum(l.w_real.numel() * l.bits_per_weight() for l in bl)
+    rel = abs(bits_ph - bits_bn) / bits_ph
+    check("bit budgets match within 5%", rel < 0.05,
+          f"phase {bits_ph/1e3:.1f} kbit vs binary {bits_bn/1e3:.1f} kbit "
+          f"({rel*100:.1f}% apart)")
+
+    # THE correctness requirement: the imaginary channel must stay identically
+    # zero end to end. If beta_im leaked, the "binary" baseline would secretly
+    # run a second real network alongside and the comparison would be void.
+    x = torch.randn(4, 3, 32, 32)
+    bn.eval()
+    with torch.no_grad():
+        r, i = bn.stem(x, torch.zeros_like(x))
+        max_im = [i.abs().max().item()]
+        for blk in bn.stages:
+            r, i = blk(r, i)
+            max_im.append(i.abs().max().item())
+        r2, i2 = r.mean(dim=(2, 3)), i.mean(dim=(2, 3))
+        orr, oii = bn.head(r2, i2)
+        max_im.append(oii.abs().max().item())
+    check("imaginary channel is identically zero throughout the binary arm",
+          max(max_im) == 0.0, f"max|Im| per stage: {[round(v, 6) for v in max_im]}")
+
+    # the phase arm must NOT be real-only - a sanity check on the check itself
+    ph.eval()
+    with torch.no_grad():
+        pr, pi = ph.stem(x, torch.zeros_like(x))
+        pr, pi = ph.stages(pr, pi)
+    check("phase arm does produce an imaginary part (control is meaningful)",
+          pi.abs().max().item() > 0, f"max|Im|={pi.abs().max():.4f}")
+
+    # all corners in the binary arm must be real ones
+    dist, _ = M.phase_histogram(bn)
+    check("binary weights land only on the real corners",
+          abs(dist[2] + dist[3]) < 1e-9,
+          f"+1={dist[0]*100:.1f}% -1={dist[1]*100:.1f}% "
+          f"+i={dist[2]*100:.1f}% -i={dist[3]*100:.1f}%")
+
+    # gradients must still reach every parameter
+    logits = bn(x)
+    F.cross_entropy(logits, torch.tensor([0, 1, 2, 3])).backward()
+    dead = [n for n, p in bn.named_parameters()
+            if p.grad is None or p.grad.abs().max() == 0]
+    check("gradient reaches every binary-arm parameter", len(dead) == 0,
+          f"dead: {dead}" if dead else "")
+
+
+# ==============================================================================
+# 6. MINI-TRAINING (does the loss actually go down?)
 # ==============================================================================
 def test_training(n_train=4000, n_val=2000, epochs=2):
     print("\n--- 5. Mini-training on a CIFAR-10 subset ---")
@@ -302,6 +390,7 @@ if __name__ == "__main__":
     test_complex_algebra()
     test_ampnorm()
     test_model()
+    test_binary_control()
     if args.train:
         test_training()
 

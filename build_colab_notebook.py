@@ -1,4 +1,4 @@
-"""
+﻿"""
 Generator for the Colab notebook that visualizes a trained CVQNN.
 
 The notebook is generated rather than hand-written: in .ipynb every line of
@@ -378,7 +378,174 @@ print("verdict:", "the phase degree of freedom is in use"
 
 # =============================================================================
 md(r"""
-## 7. How phase is born
+## 7. Trained weights on the complex plane, in 3D
+
+Section 4 drew every latent weight as a point. With millions of weights a point
+cloud saturates: you cannot tell a dense ridge from a thin haze. Here the same
+data is shown two other ways.
+
+**First, as a density surface.** The complex plane is binned into a grid and the
+height of the surface is how many weights fall into each bin. Ridges along the
+axes mean confident weights; mass piled along the diagonals `Re = ±Im` means
+weights sitting on the decision boundary, one gradient step away from flipping.
+
+Use the dropdown to move between layers.
+""")
+
+code(r"""
+import numpy as np
+import plotly.graph_objects as go
+
+BINS = 61
+
+surfaces = []
+for li, layer in enumerate(layers):
+    wr = layer.w_real.detach().flatten().cpu().numpy()
+    wi = layer.w_imag.detach().flatten().cpu().numpy()
+    scale = max(np.abs(wr).max(), np.abs(wi).max()) + 1e-9
+
+    H, xe, ye = np.histogram2d(wr / scale, wi / scale, bins=BINS,
+                               range=[[-1, 1], [-1, 1]])
+    xc = 0.5 * (xe[:-1] + xe[1:])
+    yc = 0.5 * (ye[:-1] + ye[1:])
+
+    # histogram2d indexes [x, y]; Surface expects z[row=y][col=x]
+    Z = H.T
+
+    surfaces.append(go.Surface(
+        x=xc, y=yc, z=Z, visible=(li == 0),
+        colorscale="Viridis", showscale=False,
+        name=f"layer {li}",
+        hovertemplate="Re=%{x:.2f}<br>Im=%{y:.2f}<br>weights=%{z:.0f}<extra></extra>"))
+
+fig = go.Figure(data=surfaces)
+
+# dropdown: one visible surface at a time
+buttons = []
+for li in range(len(layers)):
+    vis = [i == li for i in range(len(layers))]
+    buttons.append(dict(label=f"layer {li}", method="update",
+                        args=[{"visible": vis}]))
+
+fig.update_layout(
+    title="Latent weight density over the complex plane",
+    updatemenus=[dict(buttons=buttons, x=0, y=1.1, xanchor="left")],
+    scene=dict(xaxis_title="Re(w) / max", yaxis_title="Im(w) / max",
+               zaxis_title="weight count",
+               aspectratio=dict(x=1, y=1, z=0.6)),
+    height=700)
+fig.show()
+""")
+
+md(r"""
+**Second, as the codebook itself.** After quantization a layer's weights take
+only four distinct values, so plotting them as points would put millions of
+markers on top of each other. Instead each layer gets a unit circle at its own
+height, with a marker at each of the four corners sized by how many weights
+landed there.
+
+This is the trained network's entire weight vocabulary, drawn to scale: four
+symbols per layer and nothing else. A circle with two large and two vanishing
+markers is a layer that quietly went binary.
+""")
+
+code(r"""
+import numpy as np
+import plotly.graph_objects as go
+
+CORNER_XY = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+theta = np.linspace(0, 2 * np.pi, 121)
+
+fig = go.Figure()
+
+# a faint unit circle at every layer, for scale
+for li in range(len(layers)):
+    fig.add_trace(go.Scatter3d(
+        x=np.cos(theta), y=np.sin(theta), z=np.full_like(theta, li),
+        mode="lines", line=dict(color="rgba(140,140,140,0.35)", width=1),
+        showlegend=False, hoverinfo="skip"))
+
+for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
+    xs, ys, zs, sizes, texts = [], [], [], [], []
+    for li, layer in enumerate(layers):
+        c = M.phase_code(layer.w_real, layer.w_imag).flatten().cpu().numpy()
+        share = (c == vi).mean()
+        cx, cy = CORNER_XY[vi]
+        xs.append(cx); ys.append(cy); zs.append(li)
+        # area proportional to share, so the eye compares areas not radii
+        sizes.append(6 + 46 * np.sqrt(share))
+        texts.append(f"layer {li}<br>{vname}: {share*100:.1f}% "
+                     f"({(c == vi).sum():,} weights)")
+
+    fig.add_trace(go.Scatter3d(
+        x=xs, y=ys, z=zs, mode="markers", name=vname,
+        marker=dict(size=sizes, color=vcol, opacity=0.85),
+        text=texts, hovertemplate="%{text}<extra></extra>"))
+
+fig.update_layout(
+    title="The trained codebook: four corners per layer, sized by share",
+    scene=dict(xaxis_title="Re", yaxis_title="Im", zaxis_title="layer",
+               aspectratio=dict(x=1, y=1, z=1.8)),
+    height=760, legend=dict(itemsizing="constant"))
+fig.show()
+""")
+
+md(r"""
+**Third, how far training actually moved the weights.** This one guards against
+a specific illusion. Initialization draws `w_real` and `w_imag` independently
+from the same distribution, so by symmetry roughly a quarter of the weights
+start on each corner — a perfectly balanced histogram is therefore the *default
+state*, not evidence of anything.
+
+The honest question is how much the assignment changed. Below, an untrained
+model with the same seed is built for comparison, and the bars show the shift
+per corner.
+""")
+
+code(r"""
+import numpy as np
+import plotly.graph_objects as go
+
+torch.manual_seed(VizCFG.seed)
+fresh = M.CVQResNet(VizCFG)
+fresh_layers = M.quant_layers(fresh)
+
+def corner_shares(ls):
+    out = np.zeros(4)
+    n = 0
+    for l in ls:
+        c = M.phase_code(l.w_real, l.w_imag).flatten().cpu().numpy()
+        out += np.bincount(c, minlength=4)
+        n += c.size
+    return out / n
+
+init_share = corner_shares(fresh_layers)
+trained_share = corner_shares(layers)
+
+fig = go.Figure()
+fig.add_trace(go.Bar(x=VERTEX, y=init_share * 100, name="at initialization",
+                     marker_color="rgba(150,150,150,0.7)"))
+fig.add_trace(go.Bar(x=VERTEX, y=trained_share * 100, name="after training",
+                     marker_color=COLORS))
+fig.update_layout(barmode="group", height=430,
+                  title="Corner shares: initialization vs trained",
+                  yaxis_title="share of weights, %")
+fig.show()
+
+drift = np.abs(trained_share - init_share).sum() / 2
+print("initialization:", ", ".join(f"{v}={p*100:.1f}%"
+                                   for v, p in zip(VERTEX, init_share)))
+print("after training:", ", ".join(f"{v}={p*100:.1f}%"
+                                   for v, p in zip(VERTEX, trained_share)))
+print(f"\ntotal variation distance between the two: {drift*100:.2f}%")
+print("note: a small distance here does NOT mean weights did not move - it only")
+print("means the aggregate histogram is similar. The flip rate recorded during")
+print("training is what shows how much individual weights actually churned.")
+""")
+
+# =============================================================================
+md(r"""
+## 8. How phase is born
 
 The input is a **purely real** image: `Im = 0`. Every bit of phase downstream
 was created solely by multiplications by `±i` inside the network.
@@ -491,7 +658,7 @@ for li, (r, i) in enumerate(zip(traj_re, traj_im)):
 
 # =============================================================================
 md(r"""
-## 8. Feature maps: amplitude and phase at once
+## 9. Feature maps: amplitude and phase at once
 
 A complex feature map cannot honestly be shown as a single greyscale image —
 there are two numbers at every point. We use **domain colouring**, the standard
@@ -548,7 +715,7 @@ print("source image class:", int(y_batch[0]))
 
 # =============================================================================
 md(r"""
-## 9. Phase or amplitude: what separates the classes
+## 10. Phase or amplitude: what separates the classes
 
 The final logits are the **modulus** of a complex vector, so all phase
 information is discarded at the very last step. That raises a fair question:
@@ -613,7 +780,7 @@ print("verdict:", "phase carries class information" if spread > 0.15
 
 # =============================================================================
 md(r"""
-## 10. Class separation in feature space
+## 11. Class separation in feature space
 
 The penultimate layer yields one complex vector per image. Concatenating `Re`
 and `Im` into a single real vector and projecting to 3D with PCA gives the
@@ -661,7 +828,7 @@ fig.show()
 
 # =============================================================================
 md(r"""
-## 11. Pushing results back to GitHub
+## 12. Pushing results back to GitHub
 
 The cell below commits the artefacts. The token again comes from Secrets and
 goes through `subprocess` so it is never echoed.

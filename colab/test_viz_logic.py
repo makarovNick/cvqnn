@@ -226,10 +226,91 @@ def t_pca():
     return f"features: {X.shape[1]}, explained: {p3.explained_variance_ratio_.sum()*100:.0f}%"
 
 
+# ------------------------------------- 7a. density surface over the plane
+def t_density_surface():
+    BINS = 31
+    surfaces = []
+    for li, layer in enumerate(layers):
+        wr = layer.w_real.detach().flatten().cpu().numpy()
+        wi = layer.w_imag.detach().flatten().cpu().numpy()
+        scale = max(np.abs(wr).max(), np.abs(wi).max()) + 1e-9
+        H, xe, ye = np.histogram2d(wr / scale, wi / scale, bins=BINS,
+                                   range=[[-1, 1], [-1, 1]])
+        xc = 0.5 * (xe[:-1] + xe[1:])
+        yc = 0.5 * (ye[:-1] + ye[1:])
+        Z = H.T
+        # Surface expects z[row=y][col=x]; histogram2d returns [x, y]
+        assert Z.shape == (len(yc), len(xc)), f"transposed wrong: {Z.shape}"
+        assert Z.sum() == wr.size, "histogram lost weights"
+        surfaces.append(go.Surface(x=xc, y=yc, z=Z, visible=(li == 0)))
+    fig = go.Figure(data=surfaces)
+    buttons = [dict(label=f"layer {li}", method="update",
+                    args=[{"visible": [i == li for i in range(len(layers))]}])
+               for li in range(len(layers))]
+    fig.update_layout(updatemenus=[dict(buttons=buttons)])
+    fig.to_json()
+    return f"{len(surfaces)} surfaces, {BINS}x{BINS} bins"
+
+
+# ----------------------------------------------- 7b. codebook rings in 3D
+def t_codebook_rings():
+    CORNER_XY = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+    theta = np.linspace(0, 2 * np.pi, 121)
+    fig = go.Figure()
+    for li in range(len(layers)):
+        fig.add_trace(go.Scatter3d(x=np.cos(theta), y=np.sin(theta),
+                                   z=np.full_like(theta, li), mode="lines"))
+    total_share = np.zeros(4)
+    for vi in range(4):
+        sizes = []
+        for layer in layers:
+            c = M.phase_code(layer.w_real, layer.w_imag).flatten().cpu().numpy()
+            share = (c == vi).mean()
+            total_share[vi] += share / len(layers)
+            sizes.append(6 + 46 * np.sqrt(share))
+        assert all(s > 0 for s in sizes), "non-positive marker size"
+        fig.add_trace(go.Scatter3d(
+            x=[CORNER_XY[vi][0]] * len(layers), y=[CORNER_XY[vi][1]] * len(layers),
+            z=list(range(len(layers))), mode="markers",
+            marker=dict(size=sizes)))
+    fig.to_json()
+    assert abs(total_share.sum() - 1.0) < 1e-6, "shares do not sum to 1"
+    return f"rings: {len(layers)}, markers: 4 per ring"
+
+
+# ------------------------------------------ 7c. init vs trained comparison
+def t_init_vs_trained():
+    class Fresh(TinyCFG):
+        pass
+
+    torch.manual_seed(TinyCFG.seed)
+    fresh = M.CVQResNet(Fresh)
+
+    def corner_shares(ls):
+        out = np.zeros(4)
+        n = 0
+        for l in ls:
+            c = M.phase_code(l.w_real, l.w_imag).flatten().cpu().numpy()
+            out += np.bincount(c, minlength=4)
+            n += c.size
+        return out / n
+
+    a = corner_shares(M.quant_layers(fresh))
+    b = corner_shares(layers)
+    assert abs(a.sum() - 1) < 1e-9 and abs(b.sum() - 1) < 1e-9
+    drift = np.abs(b - a).sum() / 2
+    go.Figure([go.Bar(x=["+1", "-1", "+i", "-i"], y=a * 100),
+               go.Bar(x=["+1", "-1", "+i", "-i"], y=b * 100)]).to_json()
+    return f"total variation distance: {drift*100:.2f}%"
+
+
 for nm, fn in [
     ("latent weights in the phase square (3D)", t_latent_3d),
     ("margin to the decision boundary", t_margin),
     ("corner distribution", t_vertex_dist),
+    ("density surface over the complex plane", t_density_surface),
+    ("trained codebook as rings in 3D", t_codebook_rings),
+    ("initialization vs trained corner shares", t_init_vs_trained),
     ("hooks on the normalization layers", t_hooks),
     ("trajectories within stages", t_trajectories),
     ("domain colouring of feature maps", t_domain_coloring),
