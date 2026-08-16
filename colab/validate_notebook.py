@@ -26,6 +26,30 @@ errors = []
 defined = set(dir(__builtins__)) | {"__name__", "__file__", "get_ipython"}
 used_before_def = []
 
+# --------------------------------------------------------------------------
+# nbformat requires `source` to be a list of strings that reproduces the cell
+# under plain concatenation, so every line but the last must end in "\n".
+# Getting this wrong is silent and ugly: Jupyter renders the whole cell on one
+# line - code collapses, and a markdown cell becomes one enormous heading.
+# --------------------------------------------------------------------------
+newline_bad = []
+for idx, cell in enumerate(nb["cells"]):
+    src = cell["source"]
+    if not isinstance(src, list) or not src:
+        continue
+    for ln in src[:-1]:
+        if not ln.endswith("\n"):
+            newline_bad.append((idx, cell["cell_type"], ln[:40]))
+            break
+
+print("\n=== source line terminators ===")
+if newline_bad:
+    for idx, kind, sample in newline_bad:
+        print(f"  FAIL cell {idx} ({kind}): line without trailing newline: {sample!r}")
+    errors.append(f"{len(newline_bad)} cells with unterminated source lines")
+else:
+    print(f"  OK - all {len(nb['cells'])} cells keep their newlines")
+
 code_cells = [(i, c) for i, c in enumerate(nb["cells"]) if c["cell_type"] == "code"]
 
 for idx, cell in code_cells:

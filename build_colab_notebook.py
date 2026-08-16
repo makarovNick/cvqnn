@@ -17,15 +17,28 @@ NB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 cells = []
 
 
+def _lines(text):
+    """Split into nbformat `source` lines.
+
+    Every element except the last MUST keep its trailing newline: per the
+    nbformat spec the list is concatenated verbatim to rebuild the cell. A
+    plain .split("\\n") drops the newlines, and Jupyter then renders the whole
+    cell as a single line - code collapses onto one line and a markdown cell
+    turns into one giant `#` heading.
+    """
+    lines = text.strip("\n").split("\n")
+    return [ln + "\n" for ln in lines[:-1]] + [lines[-1]]
+
+
 def md(text):
     cells.append({"cell_type": "markdown", "metadata": {},
-                  "source": text.strip("\n").split("\n")})
+                  "source": _lines(text)})
 
 
 def code(text):
     cells.append({"cell_type": "code", "metadata": {}, "outputs": [],
                   "execution_count": None,
-                  "source": text.strip("\n").split("\n")})
+                  "source": _lines(text)})
 
 
 # =============================================================================
