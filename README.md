@@ -9,6 +9,46 @@ binary weights?*
 
 ---
 
+## Result so far
+
+CIFAR-10, 40 epochs, identical architecture and seed, Kaggle T4.
+Artefacts in [`results/kaggle-t4-40ep/`](results/kaggle-t4-40ep).
+
+| arm | bits/weight | best val acc |
+|---|---|---|
+| quantized `{+1, −1, +i, −i}` | 2 | **89.15%** |
+| complex FP32 control | 32 | 91.60% |
+| | | **gap: 2.45 pp for 16× compression** |
+
+Two diagnostics matter as much as the accuracy:
+
+**The phase degree of freedom was not abandoned.** Final corner distribution is
+`+1 = 22.2%`, `−1 = 28.4%`, `+i = 24.6%`, `−i = 24.8%` — the imaginary corners
+hold 49.4% of all weights. The network did not collapse into a binary one.
+
+**Quantization converged.** The flip rate — the fraction of weights changing
+corner per epoch — decayed `20.4% → 9.5% → 5.4% → 0.05%` over 40 epochs. By the
+end the configuration is genuinely discrete and stable, so the reported
+accuracy belongs to a network that still exists after the last step rather than
+to a momentary state.
+
+### What this does *not* yet show
+
+The comparison above prices quantization against *full precision*. It does not
+show that **phase beats sign** — the control that would settle that is a
+real-valued binary `{+1, −1}` network of matched capacity, which has not been
+run yet.
+
+The 49.4% imaginary share is suggestive but not sufficient on its own: weight
+initialization draws `w_real` and `w_imag` i.i.d., so by symmetry roughly half
+the weights start on an imaginary corner anyway. The balance proves the phase
+corners were not *abandoned*; it does not prove they were *earned*. The flip
+rate does show heavy reorganisation early on, so the final assignment is not
+merely frozen initialization noise — but the binary baseline is what turns this
+into an answer.
+
+---
+
 ## The idea
 
 A binary network stores a sign. This one stores a **corner of the phase
