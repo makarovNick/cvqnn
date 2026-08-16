@@ -1,11 +1,11 @@
 """
-Прогон логики визуализаций из Colab-ноутбука на CPU с маленькой моделью.
+Run the notebook's visualization logic on CPU against a small real model.
 
-Смысл: ноутбук нельзя «скомпилировать». Проверка синтаксиса ничего не говорит
-о том, сойдутся ли размерности, вернёт ли хук кортеж и переживёт ли plotly
-переданный массив. Здесь тот же код выполняется на настоящей модели, только
-крошечной — все ошибки формы вылезают за секунды, а не на 12-й минуте
-обучения в Colab.
+Why: a notebook cannot be "compiled". A syntax check says nothing about whether
+shapes line up, whether a hook returns a tuple, or whether plotly survives the
+array it is handed. Here the same code runs against an actual model, only a
+tiny one, so shape bugs surface in seconds rather than twelve minutes into a
+Colab training run.
 
     python test_viz_logic.py
 """
@@ -36,7 +36,7 @@ def check(name, fn):
         fails.append(name)
 
 
-# ---------------------------------------------------------------- подготовка
+# ------------------------------------------------------------------ setup
 class TinyCFG(M.CFG):
     widths = (8, 16, 24)
     blocks = (1, 1, 1)
@@ -54,11 +54,11 @@ COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
 rng = np.random.default_rng(0)
 
 print("=" * 74)
-print(f" проверка логики визуализаций | слоёв: {len(layers)} | plotly ok")
+print(f" visualization logic check | layers: {len(layers)} | plotly ok")
 print("=" * 74)
 
 
-# ------------------------------------------------- 4. латентные веса в 3D
+# ---------------------------------------------- 4. latent weights in 3D
 def t_latent_3d():
     fig = go.Figure()
     for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
@@ -74,37 +74,37 @@ def t_latent_3d():
             zs.append(np.full(len(sel), li, dtype=float))
         fig.add_trace(go.Scatter3d(x=np.concatenate(xs), y=np.concatenate(ys),
                                    z=np.concatenate(zs), mode="markers", name=vname))
-    # именно здесь ловятся ошибки типов: plotly сериализует всё лениво
+    # this is where type errors surface: plotly serialises lazily
     fig.to_json()
     n = sum(len(t.x) for t in fig.data)
-    return f"точек: {n}, трейсов: {len(fig.data)}"
+    return f"points: {n}, traces: {len(fig.data)}"
 
 
-# ------------------------------------------------------------ 5. margin
+# ------------------------------------------------------------- 5. margin
 def t_margin():
     medians = []
     for layer in layers:
         wr = layer.w_real.detach().flatten().cpu().numpy()
         wi = layer.w_imag.detach().flatten().cpu().numpy()
         margin = np.abs(np.abs(wr) - np.abs(wi)) / (np.abs(wr) + np.abs(wi) + 1e-12)
-        assert np.all((margin >= 0) & (margin <= 1)), "margin вышел за [0,1]"
+        assert np.all((margin >= 0) & (margin <= 1)), "margin escaped [0,1]"
         medians.append(np.median(margin))
     go.Figure([go.Violin(y=[0.1, 0.2, 0.3])]).to_json()
-    return f"медианы по слоям: {np.round(medians, 2).tolist()}"
+    return f"per-layer medians: {np.round(medians, 2).tolist()}"
 
 
-# ------------------------------------------- 6. распределение по вершинам
+# -------------------------------------------------- 6. corner distribution
 def t_vertex_dist():
     per_layer = np.zeros((len(layers), 4))
     for li, layer in enumerate(layers):
         c = M.phase_code(layer.w_real, layer.w_imag).flatten().cpu().numpy()
         per_layer[li] = np.bincount(c, minlength=4) / c.size
-    assert np.allclose(per_layer.sum(axis=1), 1.0), "доли не суммируются в 1"
+    assert np.allclose(per_layer.sum(axis=1), 1.0), "shares do not sum to 1"
     total = per_layer.mean(axis=0)
-    return f"по сети: {', '.join(f'{v}={p*100:.0f}%' for v, p in zip(VERTEX, total))}"
+    return f"network: {', '.join(f'{v}={p*100:.0f}%' for v, p in zip(VERTEX, total))}"
 
 
-# ------------------------------------------------- 7. хуки и траектории
+# ------------------------------------------------ 7. hooks and trajectories
 acts = []
 
 
@@ -127,8 +127,8 @@ def t_hooks():
         _ = model(x_one)
     for h in hooks:
         h.remove()
-    assert acts, "хуки не сработали"
-    return f"снято слоёв: {len(acts)}"
+    assert acts, "hooks did not fire"
+    return f"layers captured: {len(acts)}"
 
 
 def t_trajectories():
@@ -149,11 +149,11 @@ def t_trajectories():
     groups.append(cur)
     groups = [g for g in groups if len(g) > 1]
 
-    # главная проверка: внутри группы ширина обязана совпадать,
-    # иначе индекс канала обозначал бы разные признаки
+    # the point of the grouping: width must be constant inside a group,
+    # otherwise a channel index would denote different features
     for g in groups:
         widths = {len(traj_re[l]) for l in g}
-        assert len(widths) == 1, f"в группе {g} разная ширина: {widths}"
+        assert len(widths) == 1, f"group {g} has mixed widths: {widths}"
 
     fig = go.Figure()
     for gi, g in enumerate(groups):
@@ -164,14 +164,14 @@ def t_trajectories():
                 x=[traj_re[l][ci] for l in g], y=[traj_im[l][ci] for l in g],
                 z=[float(l) for l in g], mode="lines"))
     fig.to_json()
-    return f"групп: {len(groups)} {[(g[0], g[-1], len(traj_re[g[0]])) for g in groups]}"
+    return f"groups: {len(groups)} {[(g[0], g[-1], len(traj_re[g[0]])) for g in groups]}"
 
 
-# ----------------------------------------------- 8. доменная раскраска
+# ------------------------------------------------------ 8. domain colouring
 def t_domain_coloring():
     idx = min(3, len(acts) - 1)
     name, re_t, im_t = acts[idx]
-    assert re_t.dim() == 4, f"ожидалась карта признаков, получено {re_t.shape}"
+    assert re_t.dim() == 4, f"expected a feature map, got {re_t.shape}"
     re_np, im_np = re_t[0].numpy(), im_t[0].numpy()
 
     def domain_rgb(re, im):
@@ -188,13 +188,13 @@ def t_domain_coloring():
     fig = make_subplots(rows=2, cols=4)
     for k, c in enumerate(top):
         rgb = domain_rgb(re_np[c], im_np[c])
-        assert rgb.ndim == 3 and rgb.shape[2] == 3, f"плохая форма RGB: {rgb.shape}"
+        assert rgb.ndim == 3 and rgb.shape[2] == 3, f"bad RGB shape: {rgb.shape}"
         fig.add_trace(go.Image(z=rgb), row=k // 4 + 1, col=k % 4 + 1)
     fig.to_json()
-    return f"слой {name}, каналов показано: {len(top)}"
+    return f"layer {name}, channels shown: {len(top)}"
 
 
-# ---------------------------------------------- 9. комплексные логиты
+# --------------------------------------------------------- 9. complex logits
 def t_complex_logits():
     xb = torch.randn(32, 3, 32, 32)
     yb = torch.randint(0, 10, (32,))
@@ -203,15 +203,15 @@ def t_complex_logits():
         r, i = model.stages(r, i)
         r, i = r.mean(dim=(2, 3)), i.mean(dim=(2, 3))
         orr, oii = model.head(r, i)
-    assert orr.shape == (32, 10), f"форма логитов {orr.shape}"
+    assert orr.shape == (32, 10), f"logit shape {orr.shape}"
     lab = yb.numpy()
     ang = np.arctan2(oii.numpy()[np.arange(len(lab)), lab],
                      orr.numpy()[np.arange(len(lab)), lab])
     assert np.isfinite(ang).all()
-    return f"логиты {tuple(orr.shape)}, фаза считается"
+    return f"logits {tuple(orr.shape)}, phase computes"
 
 
-# ------------------------------------------------------- 10. PCA в 3D
+# -------------------------------------------------------------- 10. PCA 3D
 def t_pca():
     xb = torch.randn(64, 3, 32, 32)
     with torch.no_grad():
@@ -223,23 +223,23 @@ def t_pca():
     Z = p3.transform(X)
     assert Z.shape == (64, 3)
     go.Figure([go.Scatter3d(x=Z[:, 0], y=Z[:, 1], z=Z[:, 2], mode="markers")]).to_json()
-    return f"признаков: {X.shape[1]}, объяснено: {p3.explained_variance_ratio_.sum()*100:.0f}%"
+    return f"features: {X.shape[1]}, explained: {p3.explained_variance_ratio_.sum()*100:.0f}%"
 
 
 for nm, fn in [
-    ("латентные веса в фазовом квадрате (3D)", t_latent_3d),
-    ("запас до границы решения", t_margin),
-    ("распределение по вершинам", t_vertex_dist),
-    ("хуки на нормализациях", t_hooks),
-    ("траектории внутри стадий", t_trajectories),
-    ("доменная раскраска карт признаков", t_domain_coloring),
-    ("комплексные логиты", t_complex_logits),
-    ("PCA признаков в 3D", t_pca),
+    ("latent weights in the phase square (3D)", t_latent_3d),
+    ("margin to the decision boundary", t_margin),
+    ("corner distribution", t_vertex_dist),
+    ("hooks on the normalization layers", t_hooks),
+    ("trajectories within stages", t_trajectories),
+    ("domain colouring of feature maps", t_domain_coloring),
+    ("complex logits", t_complex_logits),
+    ("PCA of features in 3D", t_pca),
 ]:
     check(nm, fn)
 
 print("=" * 74)
 if fails:
-    print(f" ПРОВАЛЕНО {len(fails)}: {', '.join(fails)}")
+    print(f" FAILED {len(fails)}: {', '.join(fails)}")
     sys.exit(1)
-print(" ВСЕ ВИЗУАЛИЗАЦИИ ОТРАБОТАЛИ")
+print(" ALL VISUALIZATIONS RAN")

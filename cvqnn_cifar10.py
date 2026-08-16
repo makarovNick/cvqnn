@@ -1,27 +1,29 @@
 """
 ================================================================================
- CVQNN — Complex-Valued Quantized Neural Network
- Веса жёстко зафиксированы в корнях 4-й степени из единицы: {+1, -1, +i, -i}
+ CVQNN - Complex-Valued Quantized Neural Network
+ Weights hard-constrained to the 4th roots of unity: {+1, -1, +i, -i}
 ================================================================================
 
- Идея:
-   Каждый вес сети — это комплексное число единичного модуля, лежащее в одной
-   из 4 вершин "фазового квадрата". Т.е. на вес приходится ровно 2 бита
-   информации (log2(4)), но, в отличие от бинарных сетей {+1,-1}, у нас есть
-   ещё и фазовая степень свободы: умножение на i — это поворот на 90°,
-   который ПЕРЕМЕШИВАЕТ вещественный и мнимый каналы сигнала.
+ The idea:
+   Every weight is a unit-modulus complex number sitting at one of the four
+   corners of the "phase square", i.e. exactly 2 bits per weight (log2 4).
+   Unlike binary {+1,-1} networks, this buys an extra degree of freedom:
+   multiplying by i is a 90-degree rotation that MIXES the real and imaginary
+   channels of the signal. The hypothesis is that this phase coupling partly
+   compensates for the loss of weight precision.
 
-   Обучение идёт по латентным FP32-копиям (w_real, w_imag), а в forward они
-   проецируются на ближайшую вершину. Градиент проходит насквозь (STE).
+   Training runs on latent FP32 copies (w_real, w_imag); the forward pass
+   projects them onto the nearest corner and the gradient passes straight
+   through (STE).
 
- Архитектура: компактный комплекснозначный ResNet (CIFAR-style).
-   ResNet выбран вместо ViT: с нуля на 50k картинок он стабильнее,
-   не требует длинного warmup / сильных аугментаций, и переживает
-   агрессивное квантование заметно лучше (skip-connection даёт
-   градиенту чистый путь мимо квантованных слоёв).
+ Architecture: a compact complex-valued CIFAR-style ResNet.
+   ResNet rather than ViT: trained from scratch on 50k images it is far more
+   stable, needs no long warmup or heavy augmentation, and tolerates
+   aggressive quantization much better - the skip connection gives the
+   gradient a clean path around the quantized layers.
 
- Запуск: просто вставить в Kaggle Notebook (Accelerator: GPU T4/P100) и Run All.
- Зависимости: torch, torchvision, numpy, matplotlib — всё есть на Kaggle из коробки.
+ To run: paste into a Kaggle notebook (Accelerator: GPU T4) and Run All.
+ Dependencies: torch, torchvision, numpy, matplotlib - all preinstalled there.
 ================================================================================
 """
 
@@ -42,63 +44,64 @@ import matplotlib.pyplot as plt
 
 
 # ==============================================================================
-# 0. КОНФИГ
+# 0. CONFIG
 # ==============================================================================
 class CFG:
-    # --- воспроизводимость / железо ---
+    # --- reproducibility / hardware ---
     seed            = 1337
     device          = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers     = 2               # на Kaggle больше 2-4 смысла не имеет
-    use_amp         = True            # fp16 autocast (критичные места считаются в fp32)
+    num_workers     = 2               # more than 2-4 buys nothing on Kaggle
+    use_amp         = True            # fp16 autocast; critical parts stay fp32
 
-    # --- данные ---
+    # --- data ---
     data_root       = "./data"
     batch_size      = 128
     val_batch_size  = 512
 
-    # --- модель ---
-    widths          = (48, 96, 192)   # каналы по стадиям
-    blocks          = (2, 2, 2)       # residual-блоков на стадию
+    # --- model ---
+    widths          = (48, 96, 192)   # channels per stage
+    blocks          = (2, 2, 2)       # residual blocks per stage
     num_classes     = 10
 
-    # --- РЕЖИМ КВАНТОВАНИЯ (главный тумблер эксперимента) ---
-    # True  -> веса проецируются в {+1,-1,+i,-i} (наша гипотеза)
-    # False -> обычная комплексная FP32-сеть (контрольный baseline для абляции)
+    # --- QUANTIZATION SWITCH (the main experimental knob) ---
+    # True  -> weights projected onto {+1,-1,+i,-i}: the hypothesis under test
+    # False -> plain complex FP32 network: the control arm of the ablation
     quantize        = True
-    quantize_stem   = True            # квантовать первый conv (классика BNN — оставлять FP)
-    quantize_head   = True            # квантовать последний linear
-    per_channel_scale = True          # scale как вектор на выходной канал (False -> один скаляр)
-    weight_clip     = 1.0             # клиппинг латентных весов после шага; None -> выключить
+    quantize_stem   = True            # quantize the first conv (BNN practice: keep it FP)
+    quantize_head   = True            # quantize the final linear
+    per_channel_scale = True          # scale as a per-output-channel vector (False -> scalar)
+    weight_clip     = 1.0             # clip latent weights after each step; None disables
 
-    # --- обучение ---
+    # --- training ---
     epochs          = 40
     lr              = 2e-3
-    weight_decay    = 5e-2            # применяется ТОЛЬКО к не-квантованным параметрам
+    weight_decay    = 5e-2            # applied ONLY to non-quantized parameters
     label_smoothing = 0.1
     grad_clip       = 5.0
-    log_every       = 100             # шагов между промежуточными логами
+    log_every       = 100             # steps between intermediate log lines
 
-    # --- что запускать ---
-    # "both" — квантованная сеть + FP32-контроль и сравнение между ними.
-    #          Именно дельта между прогонами отвечает на вопрос ресерча,
-    #          поэтому это значение по умолчанию.
-    # "quant" / "fp32" — только один из прогонов.
-    # Переопределяется переменной окружения CVQNN_MODE (на Kaggle её не задать,
-    # поэтому основной способ настройки — правка этой строки).
+    # --- what to run ---
+    # "both"  - quantized network + FP32 control, plus the comparison between
+    #           them. The delta between the two runs is what actually answers
+    #           the research question, so this is the default.
+    # "quant" / "fp32" - a single arm only.
+    # Overridable via the CVQNN_MODE environment variable; on Kaggle env vars
+    # cannot be set, so editing this line is the primary way to configure it.
     mode            = "both"
 
-    # --- вывод ---
+    # --- output ---
     out_dir         = "./cvqnn_out"
 
 
 def check_gpu_compat(cfg=CFG):
     """
-    Ранняя проверка, что сборка PyTorch содержит ядра под выданную карту.
+    Fail fast if the installed PyTorch build has no kernels for this GPU.
 
-    Иначе первая же CUDA-операция падает с cudaErrorNoKernelImageForDevice
-    где-то в глубине сети, и по трейсбеку это выглядит как ошибка в нашем коде.
-    Реальный случай: Kaggle выдаёт Tesla P100 (sm_60), а их предустановленный
-    torch собран под sm_70+ — поддержку Pascal из сборок убрали.
+    Otherwise the very first CUDA op dies with cudaErrorNoKernelImageForDevice
+    somewhere deep inside the network, and the traceback points at our code
+    rather than at the environment. Real case: Kaggle hands out a Tesla P100
+    (sm_60) while its preinstalled torch is built for sm_70+ - Pascal support
+    was dropped from the wheels.
     """
     if cfg.device != "cuda":
         return
@@ -110,15 +113,15 @@ def check_gpu_compat(cfg=CFG):
     if sm not in arch_list:
         raise RuntimeError(
             f"\n{'!' * 70}\n"
-            f"GPU {name} имеет compute capability {sm}, но установленный\n"
-            f"PyTorch {torch.__version__} собран только под: {' '.join(arch_list)}.\n"
-            f"Любая CUDA-операция упадёт с cudaErrorNoKernelImageForDevice.\n\n"
-            f"Что делать: запросить другой ускоритель (на Kaggle — T4 вместо\n"
-            f"P100: machine_shape в kernel-metadata.json), либо поставить сборку\n"
-            f"torch под {sm}, либо считать на CPU (CFG.device = 'cpu').\n"
+            f"GPU {name} has compute capability {sm}, but the installed\n"
+            f"PyTorch {torch.__version__} was built only for: {' '.join(arch_list)}.\n"
+            f"Every CUDA op would fail with cudaErrorNoKernelImageForDevice.\n\n"
+            f"Fix: request a different accelerator (on Kaggle use T4 instead of\n"
+            f"P100 via machine_shape in kernel-metadata.json), install a torch\n"
+            f"build targeting {sm}, or fall back to CPU (CFG.device = 'cpu').\n"
             f"{'!' * 70}"
         )
-    print(f"[gpu] {name} ({sm}) — совместимость с torch {torch.__version__} подтверждена")
+    print(f"[gpu] {name} ({sm}) is compatible with torch {torch.__version__}")
 
 
 def set_seed(seed: int):
@@ -130,30 +133,30 @@ def set_seed(seed: int):
 
 
 # ==============================================================================
-# 1. КВАНТОВАТОР: PhaseQuant + Straight-Through Estimator
+# 1. QUANTIZER: PhaseQuant + Straight-Through Estimator
 # ==============================================================================
 class PhaseQuantSTE(torch.autograd.Function):
     """
-    Forward: комплексный вес W = w_real + i*w_imag проецируется на ближайшую
-             вершину фазового квадрата {+1, -1, +i, -i}.
+    Forward: the complex weight W = w_real + i*w_imag is projected onto the
+             nearest corner of the phase square {+1, -1, +i, -i}.
 
-             Правило проекции — "кто больше по модулю, тот и выжил":
-               |Re| >= |Im|  ->  q = sign(Re) * 1     (вещественная ось)
-               |Re| <  |Im|  ->  q = sign(Im) * i     (мнимая ось)
+             The rule is "larger magnitude wins":
+               |Re| >= |Im|  ->  q = sign(Re) * 1     (real axis)
+               |Re| <  |Im|  ->  q = sign(Im) * i     (imaginary axis)
 
-             Геометрически это ровно проекция на ближайшую вершину: границы
-             решения — диагонали Re = ±Im, что и есть биссектрисы между
-             соседними вершинами квадрата.
+             Geometrically this really is the nearest corner: the decision
+             boundaries are the diagonals Re = +-Im, which are exactly the
+             bisectors between adjacent corners of the square.
 
-    Backward: чистый STE — градиент по квантованному значению без изменений
-              уходит на латентные FP32-копии. Функция проекции кусочно-
-              постоянна, её настоящая производная равна нулю почти всюду,
-              поэтому её подменяем тождественной.
+    Backward: plain STE - the incoming gradient is passed to the latent FP32
+              copies untouched. The projection is piecewise constant, so its
+              true derivative is zero almost everywhere; we substitute the
+              identity instead.
     """
 
     @staticmethod
     def forward(ctx, w_real, w_imag):
-        # sign с соглашением sign(0) = +1, чтобы не рождать "мёртвые" нулевые веса
+        # sign with the convention sign(0) = +1, so we never mint dead zero weights
         ones = torch.ones_like(w_real)
         s_re = torch.where(w_real >= 0, ones, -ones)
         s_im = torch.where(w_imag >= 0, ones, -ones)
@@ -167,7 +170,7 @@ class PhaseQuantSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g_re, g_im):
-        # Straight-Through: пропускаем как есть.
+        # Straight-through: pass the gradient along unchanged.
         return g_re, g_im
 
 
@@ -177,7 +180,7 @@ def phase_quantize(w_real, w_imag):
 
 @torch.no_grad()
 def phase_code(w_real, w_imag):
-    """Целочисленный код вершины: 0:+1, 1:-1, 2:+i, 3:-i. Нужен для диагностики."""
+    """Integer corner id: 0:+1, 1:-1, 2:+i, 3:-i. Used for diagnostics only."""
     real_dominant = w_real.abs() >= w_imag.abs()
     z = torch.zeros_like(w_real, dtype=torch.int8)
     code = torch.where(
@@ -189,18 +192,18 @@ def phase_code(w_real, w_imag):
 
 
 # ==============================================================================
-# 2. КОМПЛЕКСНАЯ АЛГЕБРА ДЛЯ СЛОЁВ
+# 2. COMPLEX ALGEBRA FOR THE LAYERS
 # ==============================================================================
 def complex_op(op, x_re, x_im, w_re, w_im, cat_dim, chunk_dim):
     """
-    Комплексное применение линейного оператора (linear / conv2d):
+    Apply a linear operator (linear / conv2d) with complex arithmetic:
 
         Out_real = X_real * W_real - X_imag * W_imag
         Out_imag = X_real * W_imag + X_imag * W_real
 
-    Наивно это 4 вызова op(). Мы склеиваем [W_real; W_imag] по выходной
-    размерности и делаем 2 вызова с удвоенным числом выходов — FLOPs те же,
-    но вдвое меньше запусков ядер, что заметно на мелких свёртках.
+    Naively that is 4 calls to op(). We concatenate [W_real; W_imag] along the
+    output dimension and issue 2 calls with twice the outputs instead - same
+    FLOPs, half the kernel launches, which matters for small convolutions.
     """
     w = torch.cat([w_re, w_im], dim=cat_dim)          # (2*out, in, ...)
 
@@ -216,7 +219,7 @@ def complex_op(op, x_re, x_im, w_re, w_im, cat_dim, chunk_dim):
 
 
 class _ComplexQuantBase(nn.Module):
-    """Общая логика: латентные веса, квантование, обучаемый масштаб."""
+    """Shared plumbing: latent weights, quantization, learnable scale."""
 
     def __init__(self, weight_shape, out_features, fan_in, quantize=True,
                  per_channel_scale=True):
@@ -224,16 +227,16 @@ class _ComplexQuantBase(nn.Module):
         self.quantize = quantize
         self.fan_in = fan_in
 
-        # Латентные FP32-копии. Инициализация ~ N(0, 1/sqrt(fan_in)):
-        # для самой проекции важны только знаки и относительные модули,
-        # но такой масштаб хорошо согласуется с клиппингом в [-1, 1].
+        # Latent FP32 copies, initialised ~ N(0, 1/sqrt(fan_in)). The projection
+        # itself only cares about signs and relative magnitudes, but this scale
+        # sits comfortably inside the [-1, 1] clipping range.
         std = 1.0 / math.sqrt(fan_in)
         self.w_real = nn.Parameter(torch.randn(weight_shape) * std)
         self.w_imag = nn.Parameter(torch.randn(weight_shape) * std)
 
-        # Обучаемый ВЕЩЕСТВЕННЫЙ масштаб: квантованные веса имеют единичный
-        # модуль, поэтому дисперсия выхода раздувается как fan_in.
-        # scale возвращает сигнал в разумный диапазон (аналог alpha в XNOR-Net).
+        # Learnable REAL scale: quantized weights have unit modulus, so output
+        # variance grows with fan_in. The scale pulls the signal back into a
+        # sane range (the analogue of alpha in XNOR-Net).
         n_scale = out_features if per_channel_scale else 1
         self.scale = nn.Parameter(torch.full((n_scale,), 1.0 / math.sqrt(fan_in)))
 
@@ -290,10 +293,10 @@ class ComplexQuantConv2d(_ComplexQuantBase):
 
 
 # ==============================================================================
-# 3. АКТИВАЦИЯ И НОРМАЛИЗАЦИЯ
+# 3. ACTIVATION AND NORMALIZATION
 # ==============================================================================
 class ComplexSplitReLU(nn.Module):
-    """ReLU покомпонентно: relu(Re) + i*relu(Im)."""
+    """Component-wise ReLU: relu(Re) + i*relu(Im)."""
 
     def forward(self, x_re, x_im):
         return F.relu(x_re), F.relu(x_im)
@@ -301,18 +304,18 @@ class ComplexSplitReLU(nn.Module):
 
 class ComplexAmpNorm(nn.Module):
     """
-    Амплитудная нормализация: обе компоненты делятся на ОДИН И ТОТ ЖЕ
-    средний модуль сигнала (по батчу и пространству, отдельно на канал).
+    Amplitude normalization: both components are divided by THE SAME mean
+    modulus of the signal (over batch and space, per channel).
 
         amp   = sqrt(Re^2 + Im^2 + eps)
         m_c   = mean_{N,H,W} amp
         Re,Im = Re/m_c, Im/m_c
 
-    Ключевое свойство: деление на общий модуль СОХРАНЯЕТ ФАЗУ сигнала —
-    мы двигаем только длину вектора, не поворачивая его. Обычный BatchNorm,
-    применённый к Re и Im по отдельности, фазу бы разрушил.
+    The key property is that dividing by a shared modulus PRESERVES PHASE - we
+    only change the length of the vector, never rotate it. A plain BatchNorm
+    applied to Re and Im separately would destroy the phase.
 
-    Running-статистика ведётся как в BatchNorm, чтобы eval был детерминирован.
+    Running statistics are tracked BatchNorm-style so that eval is deterministic.
     """
 
     def __init__(self, num_features, momentum=0.1, eps=1e-5, affine=True):
@@ -322,17 +325,17 @@ class ComplexAmpNorm(nn.Module):
         self.affine = affine
         self.register_buffer("running_amp", torch.ones(num_features))
         if affine:
-            # gamma — общий для Re и Im (фазосохраняющее растяжение)
+            # gamma is shared by Re and Im: a phase-preserving rescale
             self.gamma = nn.Parameter(torch.ones(num_features))
             self.beta_re = nn.Parameter(torch.zeros(num_features))
             self.beta_im = nn.Parameter(torch.zeros(num_features))
 
     def forward(self, x_re, x_im):
-        dims = [0] + list(range(2, x_re.dim()))          # всё кроме канальной оси
+        dims = [0] + list(range(2, x_re.dim()))          # everything but the channel axis
         shape = [1, -1] + [1] * (x_re.dim() - 2)
 
         if self.training:
-            # считаем статистику в fp32: под autocast fp16 sqrt легко даёт inf/0
+            # statistics in fp32: under fp16 autocast this sqrt easily yields inf/0
             amp = torch.sqrt(x_re.float() ** 2 + x_im.float() ** 2 + self.eps)
             m = amp.mean(dim=dims)
             with torch.no_grad():
@@ -352,7 +355,7 @@ class ComplexAmpNorm(nn.Module):
 
 
 class ComplexSequential(nn.Sequential):
-    """nn.Sequential для модулей, работающих с парой (Re, Im)."""
+    """nn.Sequential for modules that take and return an (Re, Im) pair."""
 
     def forward(self, x_re, x_im):
         for module in self:
@@ -361,7 +364,7 @@ class ComplexSequential(nn.Sequential):
 
 
 # ==============================================================================
-# 4. МОДЕЛЬ: комплексный ResNet
+# 4. MODEL: complex-valued ResNet
 # ==============================================================================
 class ComplexBasicBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1, cfg=CFG):
@@ -392,7 +395,7 @@ class ComplexBasicBlock(nn.Module):
         r, i = self.conv2(r, i)
         r, i = self.norm2(r, i)
 
-        # Комплексный residual: складываем покомпонентно (= сложение в C)
+        # Complex residual: component-wise addition is addition in C
         return self.act(r + id_re, i + id_im)
 
 
@@ -411,7 +414,7 @@ class CVQResNet(nn.Module):
             ComplexSplitReLU(),
         )
 
-        # --- Стадии ---
+        # --- Stages ---
         stages = []
         in_ch = w[0]
         for si, (out_ch, n_blocks) in enumerate(zip(w, b)):
@@ -421,44 +424,44 @@ class CVQResNet(nn.Module):
                 in_ch = out_ch
         self.stages = ComplexSequential(*stages)
 
-        # --- Голова ---
+        # --- Head ---
         self.head = ComplexQuantLinear(in_ch, cfg.num_classes,
                                        cfg.quantize and cfg.quantize_head,
                                        cfg.per_channel_scale)
-        # Амплитуда неотрицательна, её динамический диапазон мал ->
-        # обучаемая температура + сдвиг на класс дают softmax'у нормальный размах.
+        # The magnitude is non-negative with a narrow dynamic range, so a
+        # learnable temperature plus a per-class shift give softmax room to work.
         self.logit_scale = nn.Parameter(torch.tensor(4.0))
         self.logit_bias = nn.Parameter(torch.zeros(cfg.num_classes))
 
     def forward(self, x):
-        # ВХОД: вещественная часть — нормализованные пиксели, мнимая — нули.
-        # Фаза "рождается" уже внутри сети, при умножении на веса ±i.
+        # INPUT: the real part is the normalized image, the imaginary part is zero.
+        # All phase is born inside the network, from multiplications by +-i.
         x_re = x
         x_im = torch.zeros_like(x)
 
         x_re, x_im = self.stem(x_re, x_im)
         x_re, x_im = self.stages(x_re, x_im)
 
-        # Комплексный global average pooling
+        # Complex global average pooling
         x_re = x_re.mean(dim=(2, 3))
         x_im = x_im.mean(dim=(2, 3))
 
         out_re, out_im = self.head(x_re, x_im)
 
-        # ВЫХОД: комплексный вектор -> вещественные логиты через амплитуду |z|
+        # OUTPUT: complex vector -> real logits via the magnitude |z|
         mag = torch.sqrt(out_re.float() ** 2 + out_im.float() ** 2 + 1e-8)
         return self.logit_scale * mag + self.logit_bias
 
 
 # ==============================================================================
-# 5. ДАННЫЕ (CIFAR-10, с оффлайн-фолбэком для Kaggle без интернета)
+# 5. DATA (CIFAR-10, with an offline fallback for Kaggle without internet)
 # ==============================================================================
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
 
 
 def resolve_cifar_root(default_root):
-    """Ищем уже скачанный CIFAR-10 (Kaggle-датасеты), иначе качаем сами."""
+    """Look for an already-downloaded CIFAR-10 (Kaggle datasets), else fetch it."""
     candidates = [default_root]
     kaggle_input = "/kaggle/input"
     if os.path.isdir(kaggle_input):
@@ -466,9 +469,9 @@ def resolve_cifar_root(default_root):
             candidates.append(os.path.join(kaggle_input, name))
     for root in candidates:
         if os.path.isdir(os.path.join(root, "cifar-10-batches-py")):
-            print(f"[data] найден локальный CIFAR-10: {root}")
+            print(f"[data] found a local CIFAR-10 copy: {root}")
             return root, False
-    print("[data] локальная копия не найдена -> скачиваем (нужен Internet: ON)")
+    print("[data] no local copy -> downloading (needs Internet: ON)")
     return default_root, True
 
 
@@ -502,7 +505,7 @@ def build_loaders(cfg=CFG):
 
 
 # ==============================================================================
-# 6. ДИАГНОСТИКА КВАНТОВАНИЯ (то, ради чего эксперимент и ставится)
+# 6. QUANTIZATION DIAGNOSTICS (the whole point of running the experiment)
 # ==============================================================================
 def quant_layers(model):
     return [m for m in model.modules()
@@ -511,7 +514,7 @@ def quant_layers(model):
 
 @torch.no_grad()
 def phase_histogram(model):
-    """Доли весов, севших в каждую из 4 вершин: {+1, -1, +i, -i}."""
+    """Fraction of weights landing on each of the 4 corners {+1, -1, +i, -i}."""
     counts = torch.zeros(4, dtype=torch.float64)
     for layer in quant_layers(model):
         code = phase_code(layer.w_real, layer.w_imag).flatten().to(torch.int64)
@@ -527,7 +530,12 @@ def snapshot_codes(model):
 
 @torch.no_grad()
 def flip_rate(model, prev_codes):
-    """Доля весов, сменивших вершину с прошлого замера — мера стабильности STE."""
+    """Fraction of weights that changed corner since the last snapshot.
+
+    This is a direct measure of STE stability: if it does not decay towards the
+    end of training, the network never settles into a discrete configuration
+    and is still rattling around the decision boundaries.
+    """
     if prev_codes is None:
         return float("nan")
     cur = snapshot_codes(model)
@@ -537,15 +545,16 @@ def flip_rate(model, prev_codes):
 
 
 # ==============================================================================
-# 7. ОБУЧЕНИЕ
+# 7. TRAINING
 # ==============================================================================
 def build_optimizer(model, cfg=CFG):
     """
-    ВАЖНО: weight decay НЕ применяется к латентным w_real/w_imag.
-    Проекция масштабно-инвариантна (важны только знаки и |Re| vs |Im|),
-    поэтому WD не регуляризует сеть, а лишь стягивает веса к нулю —
-    к области, где решение о вершине максимально шумное и веса начинают
-    беспорядочно "мигать" между вершинами.
+    IMPORTANT: weight decay is NOT applied to the latent w_real/w_imag.
+
+    The projection is scale-invariant - only the signs and the ratio of |Re| to
+    |Im| matter - so weight decay does not regularise the network at all. All
+    it does is drag the weights toward zero, into the region where the corner
+    decision is noisiest and weights start flickering between corners.
     """
     decay, no_decay = [], []
     latent_names = set()
@@ -569,7 +578,7 @@ def build_optimizer(model, cfg=CFG):
 
 
 def make_grad_scaler(cfg=CFG):
-    """GradScaler с поддержкой и нового (torch>=2.3), и старого API."""
+    """GradScaler that works with both the new (torch>=2.3) and the old API."""
     enabled = cfg.use_amp and cfg.device == "cuda"
     try:
         return torch.amp.GradScaler("cuda", enabled=enabled)
@@ -600,8 +609,8 @@ def run_epoch(model, loader, criterion, optimizer, scaler, cfg, train=True):
             scaler.step(optimizer)
             scaler.update()
 
-            # Клиппинг латентных весов: без него они уходят на ±inf,
-            # решение о вершине "замерзает" и слой перестаёт обучаться.
+            # Clipping the latent weights: without it they drift to +-inf, the
+            # corner decision freezes and the layer stops learning entirely.
             if cfg.weight_clip is not None:
                 for layer in quant_layers(model):
                     layer.clip_latent_(cfg.weight_clip)
@@ -624,7 +633,7 @@ def main(cfg=CFG):
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     print("=" * 78)
-    print(" CVQNN — веса в корнях 4-й степени из единицы {+1, -1, +i, -i}")
+    print(" CVQNN - weights at the 4th roots of unity {+1, -1, +i, -i}")
     print("=" * 78)
     print(f"device            : {cfg.device} "
           f"({torch.cuda.get_device_name(0) if cfg.device == 'cuda' else 'cpu'})")
@@ -633,8 +642,8 @@ def main(cfg=CFG):
     print(f"widths / blocks   : {cfg.widths} / {cfg.blocks}")
     print(f"epochs / bs / lr  : {cfg.epochs} / {cfg.batch_size} / {cfg.lr}")
 
-    # до скачивания данных и построения модели: если карта несовместима,
-    # незачем тратить время сессии
+    # Before downloading data or building the model: if the GPU is unusable
+    # there is no reason to burn session time.
     check_gpu_compat(cfg)
 
     train_loader, test_loader = build_loaders(cfg)
@@ -642,9 +651,9 @@ def main(cfg=CFG):
     model = CVQResNet(cfg).to(cfg.device)
     n_params = sum(p.numel() for p in model.parameters())
     n_quant = sum(l.w_real.numel() + l.w_imag.numel() for l in quant_layers(model)) // 2
-    print(f"параметров всего  : {n_params / 1e6:.2f}M")
-    print(f"квантованных весов: {n_quant / 1e6:.2f}M "
-          f"(~{n_quant * 2 / 8 / 1e6:.2f} MB при упаковке по 2 бита)")
+    print(f"total parameters  : {n_params / 1e6:.2f}M")
+    print(f"quantized weights : {n_quant / 1e6:.2f}M "
+          f"(~{n_quant * 2 / 8 / 1e6:.2f} MB packed at 2 bits each)")
     print("-" * 78)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
@@ -687,13 +696,12 @@ def main(cfg=CFG):
               f"flip {fr * 100:5.2f}%   {tr_time:.0f}s{star}")
 
     print("-" * 78)
-    print(f"ЛУЧШАЯ val accuracy: {best_acc:.2f}%")
+    print(f"BEST val accuracy: {best_acc:.2f}%")
 
     if cfg.quantize:
         dist, total = phase_histogram(model)
         labels = ["+1", "-1", "+i", "-i"]
-        print("Финальное распределение весов по вершинам "
-              f"({total / 1e6:.2f}M весов):")
+        print(f"Final weight distribution over corners ({total / 1e6:.2f}M weights):")
         for lab, p in zip(labels, dist):
             print(f"   {lab:>2} : {p * 100:5.2f}%")
     else:
@@ -708,7 +716,7 @@ def main(cfg=CFG):
 
 
 # ==============================================================================
-# 8. ГРАФИКИ
+# 8. PLOTS
 # ==============================================================================
 def plot_results(hist, dist, labels, cfg=CFG):
     n_panels = 4 if dist is not None else 3
@@ -733,7 +741,7 @@ def plot_results(hist, dist, labels, cfg=CFG):
         axes[3].bar(labels, [d * 100 for d in dist],
                     color=["#4C72B0", "#DD8452", "#55A868", "#C44E52"])
         axes[3].axhline(25, ls="--", c="gray", lw=1)
-        axes[3].set_title("Распределение по вершинам, %")
+        axes[3].set_title("Corner distribution, %")
         axes[3].grid(alpha=0.3, axis="y")
 
     plt.tight_layout()
@@ -742,14 +750,15 @@ def plot_results(hist, dist, labels, cfg=CFG):
 
 
 # ==============================================================================
-# 9. A/B-ЭКСПЕРИМЕНТ: квантованная сеть против FP32-контроля
+# 9. A/B EXPERIMENT: quantized network vs FP32 control
 # ==============================================================================
 def run_ab(cfg=CFG):
     """
-    Гоняет две ОДИНАКОВЫЕ по архитектуре сети с одним сидом:
-      A) веса зажаты в {+1,-1,+i,-i}   B) обычные комплексные FP32-веса
-    Осмысленный результат ресерча — это ДЕЛЬТА между ними, а не абсолютная
-    точность: она отвечает на вопрос "сколько стоит сжатие веса до 2 бит".
+    Train two architecturally IDENTICAL networks from the same seed:
+      A) weights constrained to {+1,-1,+i,-i}   B) plain complex FP32 weights
+
+    The meaningful research result is the DELTA between them, not the absolute
+    accuracy: it answers "what does compressing a weight to 2 bits cost?".
     """
     base_out = cfg.out_dir
 
@@ -759,17 +768,17 @@ def run_ab(cfg=CFG):
     class FP32CFG(cfg):
         quantize = False
 
-    # присваиваем снаружи: тело класса не видит локальные переменные функции
+    # assigned from outside: a class body cannot see the enclosing function's locals
     QuantCFG.out_dir = os.path.join(base_out, "quant")
     FP32CFG.out_dir = os.path.join(base_out, "fp32")
 
     print("\n\n" + "#" * 78)
-    print("#  ПРОГОН A: КВАНТОВАННАЯ СЕТЬ  {+1, -1, +i, -i}")
+    print("#  RUN A: QUANTIZED NETWORK  {+1, -1, +i, -i}")
     print("#" * 78)
     _, hist_q = main(QuantCFG)
 
     print("\n\n" + "#" * 78)
-    print("#  ПРОГОН B: КОНТРОЛЬ — комплексная FP32-сеть той же архитектуры")
+    print("#  RUN B: CONTROL - complex FP32 network, same architecture")
     print("#" * 78)
     _, hist_f = main(FP32CFG)
 
@@ -777,22 +786,22 @@ def run_ab(cfg=CFG):
     best_f = max(hist_f["val_acc"])
 
     print("\n" + "=" * 78)
-    print(" ИТОГ A/B")
+    print(" A/B RESULT")
     print("=" * 78)
-    print(f"  квантованная (2 бита/вес) : {best_q:.2f}%")
-    print(f"  FP32-контроль (32 бита)   : {best_f:.2f}%")
-    print(f"  ЦЕНА КВАНТОВАНИЯ          : {best_f - best_q:+.2f} п.п. "
-          f"при сжатии весов в 16 раз")
+    print(f"  quantized (2 bits/weight) : {best_q:.2f}%")
+    print(f"  FP32 control (32 bits)    : {best_f:.2f}%")
+    print(f"  COST OF QUANTIZATION      : {best_f - best_q:+.2f} pp "
+          f"for a 16x weight compression")
 
-    # график сравнения
+    # comparison plot
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
     ep = range(1, len(hist_q["val_acc"]) + 1)
-    ax[0].plot(ep, hist_q["val_acc"], label=f"квант {{±1,±i}} ({best_q:.1f}%)")
+    ax[0].plot(ep, hist_q["val_acc"], label=f"quantized {{+-1,+-i}} ({best_q:.1f}%)")
     ax[0].plot(ep, hist_f["val_acc"], label=f"FP32 ({best_f:.1f}%)")
-    ax[0].set_title("Val accuracy: квантование vs FP32")
+    ax[0].set_title("Val accuracy: quantized vs FP32")
     ax[0].set_xlabel("epoch"); ax[0].legend(); ax[0].grid(alpha=0.3)
 
-    ax[1].plot(ep, hist_q["val_loss"], label="квант")
+    ax[1].plot(ep, hist_q["val_loss"], label="quantized")
     ax[1].plot(ep, hist_f["val_loss"], label="FP32")
     ax[1].set_title("Val loss"); ax[1].set_xlabel("epoch")
     ax[1].legend(); ax[1].grid(alpha=0.3)
@@ -808,11 +817,11 @@ def run_ab(cfg=CFG):
 
 
 if __name__ == "__main__":
-    # Режим задаётся переменной окружения, чтобы файл оставался
-    # самодостаточным (Kaggle-скрипт принимает ровно один файл, без argv).
-    #   quant (по умолчанию) — только квантованная сеть
-    #   fp32                 — только FP32-контроль
-    #   both                 — оба прогона + сравнение
+    # The mode comes from an environment variable so that this file stays
+    # self-contained: a Kaggle script kernel takes exactly one file and no argv.
+    #   quant - quantized network only
+    #   fp32  - FP32 control only
+    #   both  - both runs plus the comparison (default, see CFG.mode)
     mode = os.environ.get("CVQNN_MODE", CFG.mode).lower()
     print(f"[mode] CVQNN_MODE={mode}")
 

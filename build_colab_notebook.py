@@ -1,9 +1,9 @@
 """
-Генератор Colab-ноутбука с визуализацией обученной CVQNN.
+Generator for the Colab notebook that visualizes a trained CVQNN.
 
-Ноутбук пишется генератором, а не руками: в .ipynb каждая строка кода —
-элемент JSON-массива, и ручное редактирование почти гарантированно ломает файл.
-Правим этот скрипт и перезапускаем.
+The notebook is generated rather than hand-written: in .ipynb every line of
+code is an element of a JSON array, and editing that by hand is a reliable way
+to produce a broken file. Edit this script and re-run it instead.
 
     python build_colab_notebook.py
 """
@@ -30,32 +30,35 @@ def code(text):
 
 # =============================================================================
 md(r"""
-# CVQNN — визуализация комплекснозначной сети с весами в {+1, −1, +i, −i}
+# CVQNN — visualizing a complex network with weights in {+1, −1, +i, −i}
 
-Каждый вес этой сети зажат в одну из **четырёх точек комплексной плоскости** —
-корней 4-й степени из единицы. Это 2 бита на вес вместо 32.
+Every weight in this network is pinned to one of **four points in the complex
+plane** — the 4th roots of unity. That is 2 bits per weight instead of 32.
 
-Ноутбук отвечает на вопросы, которые не видны в кривой accuracy:
+This notebook answers the questions an accuracy curve cannot:
 
-1. **Где на самом деле лежат латентные веса** и насколько уверенно они выбрали
-   свою вершину — или балансируют на границе и мигают от шага к шагу.
-2. **Используются ли все четыре вершины**, или сеть выродилась в две (тогда
-   фазовая степень свободы не работает и мы фактически обучили бинарную сеть).
-3. **Как из чисто вещественной картинки рождается фаза** и как она вращается
-   с глубиной.
-4. **Разделяет ли сеть классы фазой или только амплитудой** выходных логитов.
+1. **Where do the latent weights actually sit**, and how confidently did they
+   pick their corner — or are they balanced on the boundary, flipping from one
+   step to the next?
+2. **Are all four corners in use**, or has the network collapsed onto two? If
+   the imaginary corners are empty, the phase degree of freedom is doing
+   nothing and we have merely trained a binary network.
+3. **How does phase emerge** from a purely real image, and how does it rotate
+   with depth?
+4. **Does the network separate classes by phase or only by amplitude** of the
+   output logits?
 
-Визуализации интерактивные (plotly), 3D-сцены можно вращать.
+All plots are interactive (plotly); the 3D scenes can be rotated.
 
-> **Требуется GPU**: `Среда выполнения → Сменить среду выполнения → T4 GPU`
+> **GPU required**: `Runtime → Change runtime type → T4 GPU`
 """)
 
 # =============================================================================
 md(r"""
-## 1. Проверка среды
+## 1. Environment check
 
-Первым делом убеждаемся, что GPU действительно выдан — Colab молча даёт CPU,
-если GPU-квота исчерпана, и дальше всё просто работает в 30 раз медленнее.
+First make sure a GPU was actually granted. Colab quietly falls back to CPU
+when the GPU quota is exhausted, and everything then simply runs 30x slower.
 """)
 
 code(r"""
@@ -71,8 +74,8 @@ print("CUDA   :", torch.cuda.is_available(),
 """)
 
 code(r"""
-# plotly в Colab предустановлен, но версия бывает старой — 3D-сцены
-# и go.Image ведут себя по-разному между мажорными версиями.
+# plotly ships with Colab, but sometimes at an old version - 3D scenes and
+# go.Image behave differently across major releases.
 !pip install -q --upgrade plotly
 import plotly
 print("plotly :", plotly.__version__)
@@ -80,28 +83,28 @@ print("plotly :", plotly.__version__)
 
 # =============================================================================
 md(r"""
-## 2. Код проекта из GitHub
+## 2. Project code from GitHub
 
-Репозиторий приватный, поэтому нужен токен. **Не вставляй его в ячейку** —
-Colab сохраняет и код, и вывод ячеек внутрь `.ipynb`, и токен уедет в файл,
-а оттуда легко и в репозиторий.
+The repository is private, so a token is needed. **Do not paste it into a
+cell** — Colab stores both code and cell output inside the `.ipynb`, so the
+token would end up in the file and from there easily into a repository.
 
-Правильный способ — **Secrets** Colab (иконка ключа на левой панели):
+The right way is Colab **Secrets** (the key icon in the left sidebar):
 
 | Name | Value |
 |---|---|
-| `GH_TOKEN` | твой GitHub PAT |
+| `GH_TOKEN` | your GitHub PAT |
 
-Затем включи для секрета доступ этому ноутбуку (тумблер *Notebook access*).
+Then enable *Notebook access* for that secret.
 
-Ниже клонирование идёт через `subprocess`, а не через `!git clone`: строка с
-`!` печатается в вывод целиком вместе с подставленным токеном. Сразу после
-клонирования remote переписывается на чистый URL, потому что иначе токен
-осел бы в `.git/config` внутри виртуалки.
+The clone below goes through `subprocess` rather than `!git clone`: a `!` line
+is echoed into the output verbatim, token included. Right after cloning the
+remote is rewritten to a clean URL, because otherwise the token would sit in
+`.git/config` inside the VM.
 """)
 
 code(r"""
-REPO = "makarovNick/cvqnn"   # <- поправь, если репозиторий назван иначе
+REPO = "makarovNick/cvqnn"
 DIR  = "cvqnn"
 
 import os, subprocess, shutil
@@ -112,57 +115,58 @@ token = userdata.get('GH_TOKEN')
 if os.path.isdir(DIR):
     shutil.rmtree(DIR)
 
-# токен передаётся аргументом процесса и не печатается в вывод ячейки
+# the token is passed as a process argument, never echoed into cell output
 subprocess.run(
     ["git", "clone", "--depth", "1",
      f"https://x-access-token:{token}@github.com/{REPO}.git", DIR],
     check=True, capture_output=True)
 
-# убираем токен из конфига клона
+# strip the token back out of the clone's config
 subprocess.run(["git", "-C", DIR, "remote", "set-url", "origin",
                 f"https://github.com/{REPO}.git"], check=True)
 
-print("склонировано:", REPO)
+print("cloned:", REPO)
 !ls -la {DIR}
 """)
 
 md(r"""
-Если репозитория ещё нет — просто загрузи `cvqnn_cifar10.py` вручную
-(панель слева → *Файлы* → *Загрузить*) и пропусти ячейку выше.
-Ячейка ниже подхватит файл откуда угодно.
+If you would rather not use a token, just upload `cvqnn_cifar10.py` by hand
+(left sidebar → *Files* → *Upload*) and skip the cell above. The next cell
+finds the module either way.
 """)
 
 code(r"""
 import sys, os, glob
 
-# ищем модуль и в клоне, и в корне — чтобы работал любой из двух путей
+# look in the clone and in the working directory, so both paths work
 found = glob.glob("**/cvqnn_cifar10.py", recursive=True)
-assert found, "cvqnn_cifar10.py не найден: склонируй репозиторий или загрузи файл вручную"
+assert found, "cvqnn_cifar10.py not found: clone the repo or upload the file"
 
 module_dir = os.path.dirname(os.path.abspath(found[0])) or "."
 if module_dir not in sys.path:
     sys.path.insert(0, module_dir)
 
 import cvqnn_cifar10 as M
-print("модуль загружен из:", found[0])
+print("module loaded from:", found[0])
 """)
 
 # =============================================================================
 md(r"""
-## 3. Обученная модель
+## 3. A trained model
 
-Два пути. По умолчанию — быстрое дообучение прямо здесь (на T4 около 10 минут):
-для визуализации структуры весов этого достаточно, полная сходимость не нужна.
+Two options. The default is a short training run right here (about 10 minutes
+on a T4): to look at the structure of the weights that is plenty, full
+convergence is not required.
 
-Если хочется смотреть на результат полного прогона — подставь чекпоинт
-`best.pt` из выгрузки Kaggle-ядра в переменную `CKPT`.
+To inspect a full run instead, point `CKPT` at the `best.pt` from the Kaggle
+kernel output.
 """)
 
 code(r"""
 import torch, torch.nn as nn
 
-CKPT   = None    # путь к best.pt, либо None -> обучаем здесь
-EPOCHS = 12      # хватает, чтобы веса перестали быть шумом
+CKPT   = None    # path to best.pt, or None to train here
+EPOCHS = 12      # enough for the weights to stop being noise
 
 class VizCFG(M.CFG):
     epochs      = EPOCHS
@@ -180,7 +184,7 @@ train_loader, test_loader = M.build_loaders(VizCFG)
 
 if CKPT:
     model.load_state_dict(torch.load(CKPT, map_location=device))
-    print("чекпоинт загружен:", CKPT)
+    print("checkpoint loaded:", CKPT)
 else:
     crit   = nn.CrossEntropyLoss(label_smoothing=VizCFG.label_smoothing)
     opt    = M.build_optimizer(model, VizCFG)
@@ -198,22 +202,24 @@ else:
               f"val {vl:.3f}/{va:5.2f}%  {dt:.0f}s")
 
 model.eval()
-print("готово")
+print("ready")
 """)
 
 # =============================================================================
 md(r"""
-## 4. Латентные веса в фазовом квадрате
+## 4. Latent weights inside the phase square
 
-Обучение идёт по вещественным парам `(w_real, w_imag)`, а в forward каждая
-пара схлопывается в ближайшую вершину. Правило простое: **кто больше по
-модулю, тот и выжил**. Значит границы решения — это диагонали `Re = ±Im`.
+Training happens on real pairs `(w_real, w_imag)`; the forward pass collapses
+each pair onto the nearest corner. The rule is simply **larger magnitude
+wins**, which makes the decision boundaries the diagonals `Re = ±Im`.
 
-На 3D-сцене ниже: горизонтальная плоскость — комплексная плоскость латентного
-веса, вертикальная ось — глубина слоя. Цвет — вершина, в которую вес схлопнется.
+In the 3D scene below the horizontal plane is the complex plane of the latent
+weight and the vertical axis is layer depth. Colour marks the corner a weight
+will collapse to.
 
-Смотреть надо на **границы между цветами**: облако точек, размазанное вдоль
-диагонали, означает слой, где веса не определились и продолжают мигать.
+What to look for are the **boundaries between colours**: a cloud smeared along
+a diagonal is a layer whose weights have not made up their mind and keep
+flipping.
 """)
 
 code(r"""
@@ -222,7 +228,7 @@ import plotly.graph_objects as go
 
 VERTEX = ["+1", "-1", "+i", "-i"]
 COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
-MAX_PTS_PER_LAYER = 1500     # иначе plotly задохнётся на сотнях тысяч точек
+MAX_PTS_PER_LAYER = 1500     # otherwise plotly chokes on hundreds of thousands of points
 
 rng = np.random.default_rng(0)
 layers = M.quant_layers(model)
@@ -235,8 +241,8 @@ for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
         wi = layer.w_imag.detach().flatten().cpu().numpy()
         code_ = M.phase_code(layer.w_real, layer.w_imag).flatten().cpu().numpy()
 
-        # нормируем послойно: у разных слоёв разный масштаб латентных весов,
-        # без этого глубокие слои сожмутся в точку
+        # normalise per layer: latent weight scale differs between layers,
+        # without this the deeper ones shrink to a dot
         scale = max(np.abs(wr).max(), np.abs(wi).max()) + 1e-9
         sel = np.where(code_ == vi)[0]
         if len(sel) > MAX_PTS_PER_LAYER:
@@ -245,7 +251,7 @@ for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
         xs.append(wr[sel] / scale)
         ys.append(wi[sel] / scale)
         zs.append(np.full(len(sel), li, dtype=float))
-        txt.append(np.full(len(sel), f"слой {li}", dtype=object))
+        txt.append(np.full(len(sel), f"layer {li}", dtype=object))
 
     fig.add_trace(go.Scatter3d(
         x=np.concatenate(xs), y=np.concatenate(ys), z=np.concatenate(zs),
@@ -254,19 +260,19 @@ for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
         hovertemplate="Re=%{x:.3f}<br>Im=%{y:.3f}<br>%{text}<extra>" + vname + "</extra>",
     ))
 
-# границы решения: диагонали Re = ±Im, протянутые по всей глубине
+# decision boundaries: the diagonals Re = +-Im, drawn at every depth
 for sign in (1, -1):
     fig.add_trace(go.Scatter3d(
         x=[-1, 1, None] * len(layers),
         y=[-sign, sign, None] * len(layers),
         z=sum([[li, li, None] for li in range(len(layers))], []),
         mode="lines", line=dict(color="rgba(120,120,120,0.35)", width=2),
-        showlegend=(sign == 1), name="граница решения", hoverinfo="skip"))
+        showlegend=(sign == 1), name="decision boundary", hoverinfo="skip"))
 
 fig.update_layout(
-    title="Латентные веса и вершина, в которую они схлопываются",
+    title="Latent weights and the corner they collapse to",
     scene=dict(xaxis_title="Re(w) / max", yaxis_title="Im(w) / max",
-               zaxis_title="слой", aspectmode="manual",
+               zaxis_title="layer", aspectmode="manual",
                aspectratio=dict(x=1, y=1, z=1.6)),
     height=720, legend=dict(itemsizing="constant"))
 fig.show()
@@ -274,18 +280,20 @@ fig.show()
 
 # =============================================================================
 md(r"""
-## 5. Насколько уверенно веса выбрали вершину
+## 5. How confidently did the weights pick a corner
 
-Картинка выше показывает расположение, но не даёт числа. Введём **запас до
-границы**:
+The plot above shows position but gives no number. Define the **margin to the
+boundary**:
 
 $$\text{margin} = \frac{\bigl|\,|Re| - |Im|\,\bigr|}{|Re| + |Im|}$$
 
-`margin = 0` — вес ровно на диагонали, любой шаг оптимизатора перебросит его
-в соседнюю вершину. `margin = 1` — вес прижат к оси, решение устойчивое.
+`margin = 0` means the weight sits exactly on a diagonal and any optimizer step
+throws it into a neighbouring corner. `margin = 1` means it is pinned to an
+axis and the decision is stable.
 
-Это прямая мера того, сошлось ли квантование. Слой с медианой около нуля
-не выучил дискретную конфигурацию — он всё ещё дрожит.
+This is a direct measure of whether quantization converged. A layer whose
+median is near zero has not learned a discrete configuration — it is still
+shaking.
 """)
 
 code(r"""
@@ -304,25 +312,25 @@ for li, layer in enumerate(layers):
         points=False, width=0.9, line_color=COLORS[li % 4], opacity=0.7))
 
 fig.update_layout(
-    title="Запас до границы решения по слоям (0 = вес балансирует на грани)",
-    xaxis_title="слой", yaxis_title="margin", height=520, showlegend=False)
+    title="Margin to the decision boundary per layer (0 = balanced on the edge)",
+    xaxis_title="layer", yaxis_title="margin", height=520, showlegend=False)
 fig.show()
 
-print("медианный margin по слоям:",
+print("median margin per layer:",
       ", ".join(f"{li}:{m:.2f}" for li, m in enumerate(medians)))
-print(f"\nсредний по сети: {np.mean(medians):.3f}")
+print(f"\nnetwork average: {np.mean(medians):.3f}")
 """)
 
 # =============================================================================
 md(r"""
-## 6. Используются ли все четыре вершины
+## 6. Are all four corners in use
 
-Ключевая проверка гипотезы. Если сеть разложила веса примерно поровну по
-четырём вершинам — фазовая степень свободы работает. Если мнимые вершины
-`+i`/`−i` пустуют, значит сеть свелась к обычной бинарной `{+1, −1}`,
-и вся комплексная машинерия не даёт ничего.
+This is the central test of the hypothesis. If the weights spread roughly
+evenly across four corners, the phase degree of freedom is doing work. If the
+imaginary corners `+i`/`−i` sit empty, the network has reduced to an ordinary
+binary `{+1, −1}` one and the complex machinery buys nothing.
 
-Пунктир на 25% — равномерное распределение.
+The dashed line at 25% marks a uniform split.
 """)
 
 code(r"""
@@ -335,43 +343,44 @@ for li, layer in enumerate(layers):
 
 fig = go.Figure()
 for vi, (vname, vcol) in enumerate(zip(VERTEX, COLORS)):
-    fig.add_trace(go.Bar(x=[f"слой {i}" for i in range(len(layers))],
+    fig.add_trace(go.Bar(x=[f"layer {i}" for i in range(len(layers))],
                          y=per_layer[:, vi] * 100,
                          name=vname, marker_color=vcol))
 fig.add_hline(y=25, line_dash="dash", line_color="gray",
-              annotation_text="равномерно (25%)")
+              annotation_text="uniform (25%)")
 fig.update_layout(barmode="group", height=480,
-                  title="Распределение весов по вершинам, %",
-                  yaxis_title="доля весов, %")
+                  title="Weight distribution over corners, %",
+                  yaxis_title="share of weights, %")
 fig.show()
 
 total = per_layer.mean(axis=0)
-print("по сети в целом:",
+print("whole network:",
       ", ".join(f"{v}={p*100:.1f}%" for v, p in zip(VERTEX, total)))
 imag_share = total[2] + total[3]
-print(f"\nдоля мнимых вершин: {imag_share*100:.1f}%")
-print("вывод:", "фазовая степень свободы используется"
-      if imag_share > 0.35 else "СЕТЬ ВЫРОЖДАЕТСЯ В БИНАРНУЮ — мнимые вершины почти пусты")
+print(f"\nimaginary corner share: {imag_share*100:.1f}%")
+print("verdict:", "the phase degree of freedom is in use"
+      if imag_share > 0.35 else
+      "NETWORK IS DEGENERATING TO BINARY - imaginary corners nearly empty")
 """)
 
 # =============================================================================
 md(r"""
-## 7. Как рождается фаза
+## 7. How phase is born
 
-На вход подаётся **чисто вещественная** картинка: `Im = 0`. Вся фаза, которая
-появляется дальше, создана исключительно умножениями на `±i` внутри сети.
+The input is a **purely real** image: `Im = 0`. Every bit of phase downstream
+was created solely by multiplications by `±i` inside the network.
 
-Снимаем активации хуками с нормализационных слоёв — именно оттуда, а **не**
-после `ComplexSplitReLU`. Причина: split-ReLU обнуляет отрицательные части
-и загоняет сигнал в первый квадрант, где фаза зажата в `[0, π/2]`. До
-активации виден полный диапазон.
+Activations are captured with hooks on the normalization layers, deliberately
+**not** after `ComplexSplitReLU`. The split ReLU zeroes negative parts and
+pushes the signal into the first quadrant, where phase is confined to
+`[0, π/2]`; before the activation the full range is visible.
 
-**Важная оговорка о том, что здесь честно измеряется.** Ширина сети меняется
-между стадиями, поэтому «канал №5» в первом слое и «канал №5» в четвёртом —
-это разные признаки, и ломаная через всю глубину не значила бы ничего.
-Поэтому траектории строятся **только внутри стадии**, где число каналов
-постоянно и индекс канала действительно обозначает один и тот же признак.
-Стадии разведены цветом.
+**An important caveat about what is honestly measured here.** The width of the
+network changes between stages, so "channel 5" in the first layer and
+"channel 5" in the fourth are different features, and a polyline through the
+whole depth would mean nothing. Trajectories are therefore drawn **within a
+stage only**, where the channel count is constant and a channel index really
+does denote the same feature. Stages are separated by colour.
 """)
 
 code(r"""
@@ -389,7 +398,7 @@ for name, mod in model.named_modules():
     if isinstance(mod, M.ComplexAmpNorm):
         hooks.append(mod.register_forward_hook(_hook(name)))
 
-# один тестовый снимок
+# a single test image
 x_batch, y_batch = next(iter(test_loader))
 x_one = x_batch[:1].to(device)
 
@@ -399,17 +408,16 @@ with torch.no_grad():
 for h in hooks:
     h.remove()
 
-print(f"снято активаций: {len(acts)} слоёв")
-print(f"вход: Im == 0 ровно? {bool((torch.zeros_like(x_one) == 0).all())}")
+print(f"activations captured from {len(acts)} layers")
 """)
 
 code(r"""
 import numpy as np
 import plotly.graph_objects as go
 
-N_CHANNELS = 16     # самые «громкие» каналы, иначе каша
+N_CHANNELS = 16     # the loudest channels only, otherwise it is a mess
 
-# усредняем по пространству: интересует комплексное значение канала, не текстура
+# average over space: we care about the channel's complex value, not its texture
 traj_re, traj_im = [], []
 for nm, re_, im_ in acts:
     r = re_[0].mean(dim=(1, 2)).numpy() if re_.dim() == 4 else re_[0].numpy()
@@ -417,8 +425,8 @@ for nm, re_, im_ in acts:
     traj_re.append(r)
     traj_im.append(i)
 
-# группируем подряд идущие слои с одинаковым числом каналов = одна стадия.
-# Только внутри такой группы индекс канала обозначает один и тот же признак.
+# group consecutive layers of equal width into a stage. Only inside such a
+# group does a channel index denote one and the same feature.
 groups, cur = [], [0]
 for li in range(1, len(traj_re)):
     if len(traj_re[li]) == len(traj_re[li - 1]):
@@ -429,7 +437,7 @@ for li in range(1, len(traj_re)):
 groups.append(cur)
 groups = [g for g in groups if len(g) > 1]
 
-print("стадии (слои с постоянной шириной):",
+print("stages (layers of constant width):",
       [(g[0], g[-1], len(traj_re[g[0]])) for g in groups])
 
 PALETTE = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"]
@@ -448,39 +456,40 @@ for gi, g in enumerate(groups):
             z=[float(l) for l in g],
             mode="lines+markers",
             line=dict(width=3, color=col), marker=dict(size=3, color=col),
-            name=f"стадия {gi} ({n_ch} каналов)",
+            name=f"stage {gi} ({n_ch} channels)",
             legendgroup=f"g{gi}", showlegend=(k == 0),
-            hovertemplate=("Re=%{x:.2f}<br>Im=%{y:.2f}<br>слой %{z}"
-                           f"<extra>стадия {gi}, канал {ci}</extra>")))
+            hovertemplate=("Re=%{x:.2f}<br>Im=%{y:.2f}<br>layer %{z}"
+                           f"<extra>stage {gi}, channel {ci}</extra>")))
 
 fig.update_layout(
-    title="Траектории каналов в комплексной плоскости (внутри стадий)",
-    scene=dict(xaxis_title="Re", yaxis_title="Im", zaxis_title="слой",
+    title="Channel trajectories in the complex plane (within stages)",
+    scene=dict(xaxis_title="Re", yaxis_title="Im", zaxis_title="layer",
                aspectratio=dict(x=1, y=1, z=1.8)),
     height=720)
 fig.show()
 
-# разброс фазы по глубине — это уже корректно считать по всем слоям,
-# потому что здесь речь о распределении, а не о конкретном канале
-print("\nразброс фазы по слоям (станд. отклонение arg(z), рад):")
+# phase spread per layer is fine to compute across all layers: it describes a
+# distribution, not the path of any particular channel
+print("\nphase spread per layer (std of arg(z), rad):")
 for li, (r, i) in enumerate(zip(traj_re, traj_im)):
     ph = np.arctan2(i, r)
-    print(f"  слой {li:2d} ({len(r):3d} каналов): {ph.std():.3f}")
+    print(f"  layer {li:2d} ({len(r):3d} channels): {ph.std():.3f}")
 """)
 
 # =============================================================================
 md(r"""
-## 8. Карты признаков: амплитуда и фаза одновременно
+## 8. Feature maps: amplitude and phase at once
 
-Комплексную карту признаков нельзя честно показать одной серой картинкой —
-в каждой точке два числа. Используем **доменную раскраску**, стандартный приём
-для комплексных функций:
+A complex feature map cannot honestly be shown as a single greyscale image —
+there are two numbers at every point. We use **domain colouring**, the standard
+device for complex functions:
 
-* **оттенок** = фаза `arg(z)`,
-* **яркость** = амплитуда `|z|`.
+* **hue** = phase `arg(z)`,
+* **brightness** = amplitude `|z|`.
 
-Одинаковый цвет означает одинаковую фазу. Так сразу видно, формирует ли сеть
-пространственно связные фазовые структуры или фаза шумит от пикселя к пикселю.
+Equal colour means equal phase, which makes it immediately visible whether the
+network forms spatially coherent phase structures or the phase is just noise
+from pixel to pixel.
 """)
 
 code(r"""
@@ -489,14 +498,14 @@ import matplotlib.colors as mcolors
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-LAYER_IDX  = min(3, len(acts) - 1)   # неглубокий слой: там ещё видна структура
+LAYER_IDX  = min(3, len(acts) - 1)   # a shallow layer: structure is still visible there
 N_SHOW     = 8
 
 name, re_t, im_t = acts[LAYER_IDX]
 re_np, im_np = re_t[0].numpy(), im_t[0].numpy()
 
 def domain_rgb(re, im):
-    # фаза -> оттенок, амплитуда -> яркость
+    # phase -> hue, amplitude -> brightness
     amp = np.sqrt(re ** 2 + im ** 2)
     ang = np.arctan2(im, re)
     h = (ang % (2 * np.pi)) / (2 * np.pi)
@@ -508,7 +517,7 @@ energy = (re_np ** 2 + im_np ** 2).sum(axis=(1, 2))
 top = np.argsort(-energy)[:N_SHOW]
 
 fig = make_subplots(rows=2, cols=4,
-                    subplot_titles=[f"канал {c}" for c in top],
+                    subplot_titles=[f"channel {c}" for c in top],
                     horizontal_spacing=0.02, vertical_spacing=0.08)
 for k, c in enumerate(top):
     fig.add_trace(go.Image(z=domain_rgb(re_np[c], im_np[c])),
@@ -517,25 +526,25 @@ for k, c in enumerate(top):
 fig.update_xaxes(visible=False)
 fig.update_yaxes(visible=False)
 fig.update_layout(height=560,
-                  title=f"Доменная раскраска карт признаков — {name} "
-                        f"(оттенок = фаза, яркость = амплитуда)")
+                  title=f"Domain colouring of feature maps - {name} "
+                        f"(hue = phase, brightness = amplitude)")
 fig.show()
 
-print("исходное изображение, класс:", int(y_batch[0]))
+print("source image class:", int(y_batch[0]))
 """)
 
 # =============================================================================
 md(r"""
-## 9. Фаза или амплитуда: чем сеть разделяет классы
+## 9. Phase or amplitude: what separates the classes
 
-Финальные логиты — это **модуль** комплексного вектора: вся фазовая информация
-на последнем шаге выбрасывается. Возникает законный вопрос: а использовалась
-ли она вообще, или сеть могла бы обойтись вещественными весами?
+The final logits are the **modulus** of a complex vector, so all phase
+information is discarded at the very last step. That raises a fair question:
+was it used at all, or could the network have made do with real weights?
 
-Ниже — комплексные выходы головы **до** взятия модуля, по одному набору точек
-на класс. Если облака классов различаются только расстоянием от начала
-координат — работает лишь амплитуда. Если они разошлись **по углу** — фаза
-несёт информацию о классе.
+Below are the head's complex outputs **before** the modulus is taken, one
+cloud per class. If the class clouds differ only in distance from the origin,
+only amplitude is doing work. If they separate **by angle**, phase carries
+class information.
 """)
 
 code(r"""
@@ -562,19 +571,19 @@ lo_re = np.concatenate(feats_re)
 lo_im = np.concatenate(feats_im)
 lab   = np.concatenate(labels)
 
-CLASSES = ["самолёт", "авто", "птица", "кот", "олень",
-           "собака", "лягушка", "лошадь", "корабль", "грузовик"]
+CLASSES = ["airplane", "automobile", "bird", "cat", "deer",
+           "dog", "frog", "horse", "ship", "truck"]
 
 fig = go.Figure()
 for c in range(10):
     m = lab == c
-    # берём компоненту логита, отвечающую своему же классу
+    # take the logit component belonging to the sample's own class
     fig.add_trace(go.Scatter(
         x=lo_re[m, c], y=lo_im[m, c], mode="markers", name=CLASSES[c],
         marker=dict(size=4, opacity=0.6)))
 
 fig.update_layout(
-    title="Комплексные логиты до взятия модуля (компонента своего класса)",
+    title="Complex logits before the modulus (own-class component)",
     xaxis_title="Re", yaxis_title="Im", height=640,
     xaxis=dict(scaleanchor="y", scaleratio=1))
 fig.show()
@@ -582,23 +591,21 @@ fig.show()
 ang = np.arctan2(lo_im[np.arange(len(lab)), lab], lo_re[np.arange(len(lab)), lab])
 per_class_ang = [np.median(ang[lab == c]) for c in range(10)]
 spread = np.std(per_class_ang)
-print("медианная фаза по классам (рад):",
+print("median phase per class (rad):",
       ", ".join(f"{c}:{a:+.2f}" for c, a in enumerate(per_class_ang)))
-print(f"\nразброс медианных фаз между классами: {spread:.3f} рад")
-print("вывод:", "фаза несёт информацию о классе" if spread > 0.15
-      else "классы различаются в основном амплитудой")
+print(f"\nspread of per-class median phases: {spread:.3f} rad")
+print("verdict:", "phase carries class information" if spread > 0.15
+      else "classes are separated mainly by amplitude")
 """)
 
 # =============================================================================
 md(r"""
-## 10. Разделение классов в пространстве признаков
+## 10. Class separation in feature space
 
-Предпоследний слой даёт комплексный вектор на изображение. Склеиваем `Re` и
-`Im` в один вещественный вектор и проецируем в 3D методом главных компонент.
-
-Это привычная проверка «а выучилось ли вообще что-то»: чёткие сгустки по
-классам означают, что сеть построила осмысленное представление, несмотря на
-2 бита на вес.
+The penultimate layer yields one complex vector per image. Concatenating `Re`
+and `Im` into a single real vector and projecting to 3D with PCA gives the
+usual sanity check: distinct class clusters mean the network built a
+meaningful representation despite having only 2 bits per weight.
 """)
 
 code(r"""
@@ -632,8 +639,8 @@ for c in range(10):
         name=CLASSES[c], marker=dict(size=2.5, opacity=0.7)))
 
 fig.update_layout(
-    title=f"PCA признаков предпоследнего слоя "
-          f"(объяснённая дисперсия: {p3.explained_variance_ratio_.sum()*100:.1f}%)",
+    title=f"PCA of penultimate-layer features "
+          f"(explained variance: {p3.explained_variance_ratio_.sum()*100:.1f}%)",
     scene=dict(xaxis_title="PC1", yaxis_title="PC2", zaxis_title="PC3"),
     height=720)
 fig.show()
@@ -641,13 +648,13 @@ fig.show()
 
 # =============================================================================
 md(r"""
-## 11. Сохранение результатов обратно в GitHub
+## 11. Pushing results back to GitHub
 
-Ячейка ниже коммитит артефакты в репозиторий. Токен снова берётся из Secrets
-и передаётся через `subprocess`, чтобы не печататься в вывод.
+The cell below commits the artefacts. The token again comes from Secrets and
+goes through `subprocess` so it is never echoed.
 
-Подпись коммита — `noreply`-почта: история коммитов может стать публичной,
-а переписать её потом уже не выйдет.
+Commits are signed with the `noreply` address: commit history may become
+public, and it cannot be rewritten afterwards.
 """)
 
 code(r"""
@@ -657,7 +664,7 @@ from google.colab import userdata
 OUT = f"{DIR}/results/colab"
 os.makedirs(OUT, exist_ok=True)
 
-# сводка прогона в машиночитаемом виде
+# machine-readable summary of this run
 summary = {
     "vertex_distribution": {v: float(p) for v, p in zip(VERTEX, total)},
     "imag_share": float(imag_share),
@@ -665,8 +672,8 @@ summary = {
     "class_phase_spread_rad": float(spread),
 }
 with open(f"{OUT}/summary.json", "w") as f:
-    json.dump(summary, f, indent=2, ensure_ascii=False)
-print(json.dumps(summary, indent=2, ensure_ascii=False))
+    json.dump(summary, f, indent=2)
+print(json.dumps(summary, indent=2))
 """)
 
 code(r"""
@@ -682,31 +689,34 @@ git("add", "-A")
 
 status = git("status", "--short")
 if not status.strip():
-    print("нечего коммитить")
+    print("nothing to commit")
 else:
     print(status)
-    git("commit", "-m", "colab: сводка визуализации весов и активаций")
+    git("commit", "-m", "colab: weight and activation visualization summary")
     subprocess.run(
         ["git", "-C", DIR, "push",
          f"https://x-access-token:{token}@github.com/{REPO}.git", "HEAD:main"],
         check=True, capture_output=True)
-    print("запушено")
+    print("pushed")
 """)
 
 # =============================================================================
 md(r"""
-## Что дальше
+## Where to go from here
 
-Если картинки показали, что **мнимые вершины пустуют** — фазовая гипотеза на
-этой архитектуре не работает, и стоит смотреть в сторону явной фазовой
-регуляризации либо инициализации, разводящей веса по четырём вершинам.
+If the plots show the **imaginary corners sitting empty**, the phase hypothesis
+does not hold on this architecture, and the next thing to try is explicit phase
+regularization or an initialization that spreads weights across all four
+corners deliberately.
 
-Если **margin у глубоких слоёв около нуля** — квантование не сошлось; лечится
-либо более длинным расписанием, либо затуханием шума STE к концу обучения.
+If the **margin in deep layers is near zero**, quantization has not converged;
+that is usually fixed either by a longer schedule or by annealing the STE noise
+towards the end of training.
 
-Если **фаза логитов не разделяет классы** — модуль на выходе выбрасывает
-слишком много, и имеет смысл попробовать читать логиты иначе: например, как
-проекцию на обучаемое комплексное направление вместо модуля.
+If the **logit phase does not separate classes**, taking the modulus at the
+output throws away too much, and it is worth reading the logits differently —
+for example as a projection onto a learnable complex direction instead of a
+magnitude.
 """)
 
 # =============================================================================
@@ -728,5 +738,5 @@ with open(NB_PATH, "w", encoding="utf-8") as f:
 
 n_code = sum(1 for c in cells if c["cell_type"] == "code")
 n_md = sum(1 for c in cells if c["cell_type"] == "markdown")
-print(f"записано: {NB_PATH}")
-print(f"ячеек: {n_code} кода + {n_md} markdown")
+print(f"written: {NB_PATH}")
+print(f"cells: {n_code} code + {n_md} markdown")

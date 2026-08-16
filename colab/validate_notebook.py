@@ -1,11 +1,11 @@
 """
-Проверка сгенерированного ноутбука до запуска в Colab:
-  - валидность JSON и структуры nbformat;
-  - синтаксис каждой ячейки кода (строки с ! и % магией отбрасываются);
-  - что имена, используемые между ячейками, где-то определены.
+Validate the generated notebook before running it in Colab:
+  - JSON validity and nbformat structure;
+  - syntax of every code cell (lines with ! or % magics are stripped first);
+  - that names used across cells are defined somewhere.
 
-Последнее ловит самую частую ошибку в ноутбуках — ячейка опирается на
-переменную, которая осталась в черновике и до финальной версии не дожила.
+The last check catches the most common notebook bug: a cell relying on a
+variable that lived in an earlier draft and never made it into the final one.
 """
 
 import ast
@@ -20,30 +20,27 @@ with open(NB, encoding="utf-8") as f:
     nb = json.load(f)
 
 print(f"nbformat {nb['nbformat']}.{nb['nbformat_minor']}, "
-      f"ячеек: {len(nb['cells'])}, accelerator={nb['metadata'].get('accelerator')}")
+      f"cells: {len(nb['cells'])}, accelerator={nb['metadata'].get('accelerator')}")
 
 errors = []
-defined = set(dir(__builtins__)) | {
-    "__name__", "__file__", "get_ipython",
-}
+defined = set(dir(__builtins__)) | {"__name__", "__file__", "get_ipython"}
 used_before_def = []
 
 code_cells = [(i, c) for i, c in enumerate(nb["cells"]) if c["cell_type"] == "code"]
 
 for idx, cell in code_cells:
     src_lines = cell["source"]
-    # магии Colab не являются валидным Python — убираем их для разбора
-    clean = [ln for ln in src_lines
-             if not ln.lstrip().startswith(("!", "%"))]
+    # Colab magics are not valid Python - drop them before parsing
+    clean = [ln for ln in src_lines if not ln.lstrip().startswith(("!", "%"))]
     src = "\n".join(clean)
 
     try:
         tree = ast.parse(src)
     except SyntaxError as e:
-        errors.append(f"ячейка {idx}: SyntaxError строка {e.lineno}: {e.msg}")
+        errors.append(f"cell {idx}: SyntaxError line {e.lineno}: {e.msg}")
         continue
 
-    # что ячейка определяет
+    # what this cell defines
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
             defined.add(node.id)
@@ -59,30 +56,28 @@ for idx, cell in code_cells:
             defined.add(node.arg)
         elif isinstance(node, ast.ExceptHandler) and node.name:
             defined.add(node.name)
-        elif isinstance(node, (ast.comprehension,)):
-            pass
 
-    # что ячейка читает
+    # what this cell reads
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
             if node.id not in defined:
                 used_before_def.append((idx, node.id))
 
-print(f"\n=== синтаксис: {len(code_cells)} ячеек кода ===")
+print(f"\n=== syntax: {len(code_cells)} code cells ===")
 if errors:
     for e in errors:
         print("  FAIL", e)
 else:
-    print("  OK — все ячейки разбираются")
+    print("  OK - every cell parses")
 
-print("\n=== имена, использованные до определения ===")
+print("\n=== names used before being defined ===")
 if used_before_def:
     seen = {}
     for idx, name in used_before_def:
         seen.setdefault(name, idx)
     for name, idx in sorted(seen.items(), key=lambda kv: kv[1]):
-        print(f"  ячейка {idx}: {name}")
+        print(f"  cell {idx}: {name}")
 else:
-    print("  OK — таких нет")
+    print("  OK - none")
 
 sys.exit(1 if errors else 0)
