@@ -68,6 +68,40 @@ reductions). So the advantage is roughly three times the observed noise, from a
 single seed per arm. Suggestive, and consistent with the flip-rate and corner
 evidence, but two or three seeds would be needed to call it settled.
 
+### Spending the saved memory: 2× parameters bought nothing
+
+With a 32× saving available, the obvious move is a bigger network. Two arms of
+equal budget, differing only in shape.
+Artefacts in [`results/scaling-40ep/`](results/scaling-40ep).
+
+| arm | shape | size | best val acc |
+|---|---|---|---|
+| base | (48, 96, 192) × (2,2,2) | 0.39 MB | 88.60% |
+| deeper | (48, 96, 192) × (4,4,4) | 0.83 MB | 88.44% |
+| wider | (70, 140, 280) × (2,2,2) | 0.83 MB | 82.78% |
+| FP32 reference | (48, 96, 192) × (2,2,2) | 12.49 MB | 91.60% |
+
+**Doubling the depth changed nothing** — 88.44% against the base's 88.60%, a
+difference well inside the 0.55 pp noise floor. Twice the parameters, twice the
+compute, no gain.
+
+**The wider arm is not a finding about width.** It is undertrained, and the
+diagnostics say so unambiguously: train accuracy 87.73% against ~95% for the
+other two, the *smallest* train–val gap of the three (+5.09 pp, i.e. it
+underfits), validation loss still at its minimum on the final epoch, and an
+accuracy curve still climbing when the cosine schedule ran out. The 40-epoch
+budget was tuned for the base configuration and does not transfer.
+
+So the honest reading is **not** "depth beats width". It is that the binding
+constraint at this scale is the optimization schedule rather than capacity, and
+that the depth-versus-width question remains open until both arms are trained
+to convergence.
+
+One correlate worth recording: the wider arm's flip rate fell faster than the
+others (8.58% at epoch 5 against 13.21% for the base) — its weights committed
+to corners earlier while learning more slowly. Whether that is cause or symptom
+is not established here.
+
 ### What this does *not* yet show
 
 The 49.4% imaginary share, taken alone, proves less than it appears to. Weight
