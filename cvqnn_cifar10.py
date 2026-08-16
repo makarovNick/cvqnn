@@ -92,13 +92,27 @@ class CFG:
     # quantization noise compounds with depth. So both arms below carry the
     # SAME parameter budget (2x the base run) and differ only in how it is
     # spent - which turns a vague "scale it up" into an actual comparison.
+    # Current ladder answers a prerequisite question the 40-epoch runs exposed:
+    # every number recorded so far was measured at an arbitrary stopping point.
+    # The base arm's validation loss was still at its minimum on the final
+    # epoch, and the wider arm was visibly still climbing - so "wider is worse"
+    # compared a converged network against one stopped mid-training.
+    #
+    # Running both to 100 epochs settles two things at once: whether the base
+    # recipe was schedule-limited (which would qualify every earlier gap), and
+    # whether width was ever the problem.
     scaling_arms = (
-        {"name": "deeper", "widths": (48, 96, 192),  "blocks": (4, 4, 4)},
-        # 70 rather than 68: doubling the blocks does not exactly double the
-        # parameters (the stem and the downsample convs do not scale with it),
-        # so the widths are nudged until both arms land within ~1% of each other
-        {"name": "wider",  "widths": (70, 140, 280), "blocks": (2, 2, 2)},
+        {"name": "base",  "widths": (48, 96, 192),  "blocks": (2, 2, 2)},
+        {"name": "wider", "widths": (70, 140, 280), "blocks": (2, 2, 2)},
     )
+
+    # Whether the ladder above is meant to hold every arm at the same number of
+    # bits. It is True when the question is "which shape spends a fixed budget
+    # better" (deeper vs wider), and False when the arms deliberately differ in
+    # size, as here: base and wider are being trained to convergence to find out
+    # whether the earlier width verdict was really a verdict about the schedule.
+    # The smoke test enforces parity only when this says it should.
+    scaling_budget_matched = False
 
     # Best val accuracy of the recorded FP32 control (results/kaggle-t4-40ep),
     # quoted for context so a scaling run does not have to retrain it.
@@ -110,7 +124,7 @@ class CFG:
     weight_clip     = 1.0             # clip latent weights after each step; None disables
 
     # --- training ---
-    epochs          = 40
+    epochs          = 100
     lr              = 2e-3
     weight_decay    = 5e-2            # applied ONLY to non-quantized parameters
     label_smoothing = 0.1
