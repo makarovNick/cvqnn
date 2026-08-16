@@ -14,11 +14,16 @@ binary weights?*
 CIFAR-10, 40 epochs, identical architecture and seed, Kaggle T4.
 Artefacts in [`results/kaggle-t4-40ep/`](results/kaggle-t4-40ep).
 
-| arm | bits/weight | best val acc |
-|---|---|---|
-| quantized `{+1, −1, +i, −i}` | 2 | **89.15%** |
-| complex FP32 control | 32 | 91.60% |
-| | | **gap: 2.45 pp for 16× compression** |
+| arm | bits per complex weight | deployed size | best val acc |
+|---|---|---|---|
+| quantized `{+1, −1, +i, −i}` | 2 | 0.39 MB | **89.15%** |
+| complex FP32 control | 64 | 12.49 MB | 91.60% |
+| | | | **gap: 2.45 pp for 32× compression** |
+
+The ratio is 32×, not 16×: both arms hold the same 1.56M *complex* weights, but
+a complex FP32 weight is `w_real + w_imag` — two float32, 64 bits — against 2
+bits for a corner index. (The FP32 checkpoint on disk is 12.55 MB against 12.49
+MB predicted, which confirms the accounting.)
 
 Two diagnostics matter as much as the accuracy:
 

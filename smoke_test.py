@@ -310,7 +310,64 @@ def test_binary_control():
 
 
 # ==============================================================================
-# 6. MINI-TRAINING (does the loss actually go down?)
+# 6. SCALING ARMS
+# ==============================================================================
+def test_scaling_arms():
+    print("\n--- 6. Scaling arms ---")
+
+    sizes = {}
+    for arm in M.CFG.scaling_arms:
+        class ArmCFG(M.CFG):
+            device = "cpu"
+            quantize = True
+            weight_mode = "phase4"
+        ArmCFG.widths = tuple(arm["widths"])
+        ArmCFG.blocks = tuple(arm["blocks"])
+        sizes[arm["name"]] = M.deployed_bits(ArmCFG)
+
+    check(f"scaling arms defined: {list(sizes)}", len(sizes) >= 2)
+
+    # The whole point of this comparison is that the arms differ ONLY in shape.
+    # If their budgets drift apart it silently becomes "bigger vs smaller",
+    # which is a question nobody needed to spend GPU hours on.
+    lo, hi = min(sizes.values()), max(sizes.values())
+    rel = (hi - lo) / hi
+    check("scaling arms carry an equal budget within 2%", rel < 0.02,
+          ", ".join(f"{k}={v/8/1e6:.2f}MB" for k, v in sizes.items())
+          + f" ({rel*100:.2f}% apart)")
+
+    # deployed size must count corner indices, not the FP32 latent copies
+    class Q(M.CFG):
+        device = "cpu"
+        quantize = True
+        weight_mode = "phase4"
+
+    class F(M.CFG):
+        device = "cpu"
+        quantize = False
+
+    qb, fb = M.deployed_bits(Q), M.deployed_bits(F)
+    check("deployed FP32 counts 64 bits per complex weight (not 32)",
+          abs(fb / qb - 32) < 0.01,
+          f"ratio {fb/qb:.1f}x  ({qb/8/1e6:.2f} MB vs {fb/8/1e6:.2f} MB)")
+
+    # and the arms must actually build and run
+    class Deep(M.CFG):
+        device = "cpu"
+        widths = (8, 16, 24)
+        blocks = (3, 3, 3)
+        quantize = True
+        weight_mode = "phase4"
+
+    m = M.CVQResNet(Deep)
+    out = m(torch.randn(2, 3, 32, 32))
+    check("a deeper arm builds and runs",
+          out.shape == (2, 10) and bool(torch.isfinite(out).all()),
+          f"{len(M.quant_layers(m))} quantized layers")
+
+
+# ==============================================================================
+# 7. MINI-TRAINING (does the loss actually go down?)
 # ==============================================================================
 def test_training(n_train=4000, n_val=2000, epochs=2):
     print("\n--- 5. Mini-training on a CIFAR-10 subset ---")
@@ -391,6 +448,7 @@ if __name__ == "__main__":
     test_ampnorm()
     test_model()
     test_binary_control()
+    test_scaling_arms()
     if args.train:
         test_training()
 

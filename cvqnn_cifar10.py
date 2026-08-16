@@ -83,6 +83,27 @@ class CFG:
     # channels grow by sqrt(2). main() prints the actual bit totals so the
     # match can be audited rather than taken on trust.
     binary_widths   = (68, 136, 272)
+
+    # --- SCALING LADDER (mode = "scaling") ---
+    # 32x compression means the saved memory can be spent on a bigger network.
+    # The question is not only "does bigger help" but "bigger HOW": for low-bit
+    # networks the literature generally finds width more valuable than depth,
+    # because each layer's capacity is capped by its channel count and
+    # quantization noise compounds with depth. So both arms below carry the
+    # SAME parameter budget (2x the base run) and differ only in how it is
+    # spent - which turns a vague "scale it up" into an actual comparison.
+    scaling_arms = (
+        {"name": "deeper", "widths": (48, 96, 192),  "blocks": (4, 4, 4)},
+        # 70 rather than 68: doubling the blocks does not exactly double the
+        # parameters (the stem and the downsample convs do not scale with it),
+        # so the widths are nudged until both arms land within ~1% of each other
+        {"name": "wider",  "widths": (70, 140, 280), "blocks": (2, 2, 2)},
+    )
+
+    # Best val accuracy of the recorded FP32 control (results/kaggle-t4-40ep),
+    # quoted for context so a scaling run does not have to retrain it.
+    fp32_reference       = 91.60
+    fp32_reference_mb    = 12.49
     quantize_stem   = True            # quantize the first conv (BNN practice: keep it FP)
     quantize_head   = True            # quantize the final linear
     per_channel_scale = True          # scale as a per-output-channel vector (False -> scalar)
@@ -881,10 +902,12 @@ def run_ab(cfg=CFG):
     print("\n" + "=" * 78)
     print(" A/B RESULT")
     print("=" * 78)
-    print(f"  quantized (2 bits/weight) : {best_q:.2f}%")
-    print(f"  FP32 control (32 bits)    : {best_f:.2f}%")
-    print(f"  COST OF QUANTIZATION      : {best_f - best_q:+.2f} pp "
-          f"for a 16x weight compression")
+    # A complex FP32 weight is w_real + w_imag = two float32 = 64 bits, not 32.
+    # Getting this wrong understates the compression by a factor of two.
+    print(f"  quantized (2 bits/complex weight) : {best_q:.2f}%")
+    print(f"  FP32 control (64 bits)            : {best_f:.2f}%")
+    print(f"  COST OF QUANTIZATION              : {best_f - best_q:+.2f} pp "
+          f"for a 32x weight compression")
 
     # comparison plot
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -983,13 +1006,121 @@ def run_phase_vs_binary(cfg=CFG):
     return hist_p, hist_b
 
 
+# ==============================================================================
+# 11. SCALING: spending the saved memory
+# ==============================================================================
+def deployed_bits(cfg):
+    """Bits the weights of this configuration would occupy once deployed.
+
+    Latent FP32 copies exist only during training; a shipped quantized model
+    stores a corner index per weight. Reporting the checkpoint size instead
+    would overstate a quantized model by 32x.
+    """
+    probe = CVQResNet(cfg)
+    qls = quant_layers(probe)
+    if qls:
+        return sum(l.w_real.numel() * l.bits_per_weight() for l in qls)
+    # complex FP32: w_real + w_imag, two float32 per complex weight
+    n_complex = sum(m.w_real.numel() for m in probe.modules()
+                    if isinstance(m, _ComplexQuantBase))
+    return n_complex * 2 * 32
+
+
+def run_scaling(cfg=CFG):
+    """
+    Quantization bought a 32x memory saving. This asks what to buy with it.
+
+    Every arm carries the same parameter budget and differs only in how it is
+    spent - depth versus width - so the comparison isolates the choice instead
+    of confounding it with "one network is simply larger".
+
+    The FP32 control is not retrained: it is quoted from the recorded run,
+    which used the same seed, schedule and data pipeline. Its accuracy is a
+    reference line, not a competitor measured under different conditions.
+    """
+    base_out = cfg.out_dir
+    rows = []
+
+    for arm in cfg.scaling_arms:
+        class ArmCFG(cfg):
+            quantize = True
+            weight_mode = "phase4"
+
+        ArmCFG.widths = tuple(arm["widths"])
+        ArmCFG.blocks = tuple(arm["blocks"])
+        ArmCFG.out_dir = os.path.join(base_out, arm["name"])
+
+        bits = deployed_bits(ArmCFG)
+        print("\n\n" + "#" * 78)
+        print(f"#  ARM '{arm['name']}': widths={ArmCFG.widths} blocks={ArmCFG.blocks}")
+        print(f"#  deployed weights: {bits / 8 / 1e6:.2f} MB "
+              f"({cfg.fp32_reference_mb / (bits / 8 / 1e6):.1f}x smaller than FP32)")
+        print("#" * 78)
+
+        _, hist = main(ArmCFG)
+        rows.append({
+            "name": arm["name"],
+            "widths": list(ArmCFG.widths),
+            "blocks": list(ArmCFG.blocks),
+            "mb": bits / 8 / 1e6,
+            "best": max(hist["val_acc"]),
+            "final_flip": hist["flip_rate"][-1],
+            "hist": hist,
+        })
+
+    print("\n" + "=" * 78)
+    print(" SCALING RESULT - equal parameter budget, different shape")
+    print("=" * 78)
+    print(f"{'arm':<10}{'widths':<18}{'blocks':<12}{'MB':>7}{'vs FP32':>9}"
+          f"{'val acc':>9}{'gap':>8}")
+    print("-" * 78)
+    for r in rows:
+        gap = r["best"] - cfg.fp32_reference
+        print(f"{r['name']:<10}{str(tuple(r['widths'])):<18}"
+              f"{str(tuple(r['blocks'])):<12}{r['mb']:>7.2f}"
+              f"{cfg.fp32_reference_mb / r['mb']:>8.0f}x{r['best']:>9.2f}{gap:>+8.2f}")
+    print("-" * 78)
+    print(f"{'FP32 ref':<10}{'(48, 96, 192)':<18}{'(2, 2, 2)':<12}"
+          f"{cfg.fp32_reference_mb:>7.2f}{'1x':>9}{cfg.fp32_reference:>9.2f}"
+          f"{0.0:>+8.2f}")
+    print("\nfinal flip rate per arm (near zero = quantization settled):")
+    for r in rows:
+        print(f"  {r['name']:<10}{r['final_flip']*100:6.3f}%")
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    for r in rows:
+        ep = range(1, len(r["hist"]["val_acc"]) + 1)
+        ax[0].plot(ep, r["hist"]["val_acc"],
+                   label=f"{r['name']} {tuple(r['widths'])}x{tuple(r['blocks'])} "
+                         f"({r['best']:.1f}%)")
+        ax[1].plot(ep, [f * 100 for f in r["hist"]["flip_rate"]], label=r["name"])
+    ax[0].axhline(cfg.fp32_reference, ls="--", c="gray",
+                  label=f"FP32 reference ({cfg.fp32_reference:.1f}%)")
+    ax[0].set_title("Val accuracy at an equal parameter budget")
+    ax[0].set_xlabel("epoch"); ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3)
+    ax[1].set_title("Weight flip rate, % / epoch")
+    ax[1].set_xlabel("epoch"); ax[1].legend(); ax[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(base_out, "scaling.png"), dpi=140)
+    plt.show()
+
+    with open(os.path.join(base_out, "scaling.json"), "w") as f:
+        json.dump({"fp32_reference": cfg.fp32_reference,
+                   "fp32_reference_mb": cfg.fp32_reference_mb,
+                   "arms": [{k: v for k, v in r.items() if k != "hist"}
+                            for r in rows]}, f, indent=2)
+    return rows
+
+
 if __name__ == "__main__":
     # The mode comes from an environment variable so that this file stays
     # self-contained: a Kaggle script kernel takes exactly one file and no argv.
     #   quant     - quantized network only
     #   fp32      - FP32 control only
     #   both      - quantized + FP32 control and their comparison
-    #   vs_binary - phase vs sign at an equal bit budget (see CFG.mode)
+    #   vs_binary - phase vs sign at an equal bit budget
+    #   scaling   - spend the saved memory: deeper vs wider (see CFG.mode)
     mode = os.environ.get("CVQNN_MODE", CFG.mode).lower()
     print(f"[mode] CVQNN_MODE={mode}")
 
@@ -997,6 +1128,8 @@ if __name__ == "__main__":
         run_ab(CFG)
     elif mode == "vs_binary":
         run_phase_vs_binary(CFG)
+    elif mode == "scaling":
+        run_scaling(CFG)
     elif mode == "fp32":
         class _FP(CFG):
             quantize = False
